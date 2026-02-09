@@ -2045,6 +2045,12 @@ static void handle_rrcSetupComplete(gNB_RRC_INST *rrc, gNB_RRC_UE_t *UE, const N
 #endif
 
   rrc_gNB_process_RRCSetupComplete(rrc, UE, setup_complete->criticalExtensions.choice.rrcSetupComplete);
+  /* === FORCE one-time RRCReconfiguration to carry HELLO (Rel-18 RRC) === */
+if (!UE->ongoing_reconfiguration) {
+  LOG_I(NR_RRC, "FORCE: trigger nr_rrc_reconfiguration_req() to send RRCReconfiguration (HELLO)\n");
+  nr_rrc_reconfiguration_req(rrc, UE, 0, 0);
+}
+
   return;
 }
 

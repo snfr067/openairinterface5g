@@ -2600,6 +2600,27 @@ static int nr_rrc_ue_decode_dcch(NR_UE_RRC_INST_t *rrc,
           break;
 
         case NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration: {
+	  /* === Custom HELLO sniff from RRCReconfiguration lateNonCriticalExtension === */
+{
+  NR_RRCReconfiguration_t *reconf = c1->choice.rrcReconfiguration;
+
+  if (reconf &&
+      reconf->criticalExtensions.present ==
+          NR_RRCReconfiguration__criticalExtensions_PR_rrcReconfiguration) {
+
+    NR_RRCReconfiguration_IEs_t *ies =
+        reconf->criticalExtensions.choice.rrcReconfiguration;
+
+    if (ies && ies->lateNonCriticalExtension && ies->lateNonCriticalExtension->buf &&
+        ies->lateNonCriticalExtension->size > 0) {
+
+      LOG_I(NR_RRC, "UE received lateNonCriticalExtension: %.*s\n",
+            (int)ies->lateNonCriticalExtension->size,
+            (char *)ies->lateNonCriticalExtension->buf);
+    }
+  }
+}
+
           nr_rrc_ue_process_rrcReconfiguration(rrc, gNB_indexP, c1->choice.rrcReconfiguration);
           if (rrc->reconfig_after_reestab) {
             // if this is the first RRCReconfiguration message after successful completion of the RRC re-establishment procedure

@@ -566,6 +566,21 @@ static NR_RRCReconfiguration_IEs_t *build_RRCReconfiguration_IEs(const nr_rrc_re
     }
   }
 
+    /* === Custom HELLO over lateNonCriticalExtension (OCTET STRING) === */
+  {
+    static const char hello[] = "HELLO";
+    /* lateNonCriticalExtension is OPTIONAL OCTET STRING.
+       In asn1c generated code, OCTET STRING is OCTET_STRING_t. */
+    ie->lateNonCriticalExtension = calloc(1, sizeof(*ie->lateNonCriticalExtension));
+    if (ie->lateNonCriticalExtension) {
+      OCTET_STRING_fromBuf(ie->lateNonCriticalExtension, hello, sizeof(hello) - 1);
+      LOG_I(NR_RRC, "Injected lateNonCriticalExtension=\"%s\" into RRCReconfiguration\n", hello);
+    } else {
+      LOG_E(NR_RRC, "Failed to allocate lateNonCriticalExtension\n");
+    }
+  }
+
+
   return ie;
 }
 
@@ -767,6 +782,21 @@ int do_NR_RRCReconfigurationComplete_for_nsa(
 	NR_RRCReconfigurationComplete__criticalExtensions_PR_rrcReconfigurationComplete;
   rrc_complete_msg.criticalExtensions.choice.rrcReconfigurationComplete->nonCriticalExtension = NULL;
   rrc_complete_msg.criticalExtensions.choice.rrcReconfigurationComplete->lateNonCriticalExtension = NULL;
+    /* === Custom HELLO response over lateNonCriticalExtension === */
+  {
+    static const char hello[] = "HELLO";
+    rrc_complete_msg.criticalExtensions.choice.rrcReconfigurationComplete->lateNonCriticalExtension =
+        calloc(1, sizeof(OCTET_STRING_t));
+    if (rrc_complete_msg.criticalExtensions.choice.rrcReconfigurationComplete->lateNonCriticalExtension) {
+      OCTET_STRING_fromBuf(
+          rrc_complete_msg.criticalExtensions.choice.rrcReconfigurationComplete->lateNonCriticalExtension,
+          hello, sizeof(hello) - 1);
+      LOG_I(NR_RRC, "UE injected lateNonCriticalExtension=\"%s\" into RRCReconfigurationComplete\n", hello);
+    } else {
+      LOG_E(NR_RRC, "UE failed to allocate lateNonCriticalExtension in RRCReconfigurationComplete\n");
+    }
+  }
+
   if (0) {
     xer_fprint(stdout, &asn_DEF_NR_RRCReconfigurationComplete, (void *)&rrc_complete_msg);
   }
