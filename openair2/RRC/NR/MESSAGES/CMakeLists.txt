@@ -1,14 +1,16 @@
-set(NR_RRC_VERSION 17 3 0)
+set(NR_RRC_VERSION 18 2 0)
 make_version(NR_RRC_cc ${NR_RRC_VERSION})
 string(REPLACE ";" "." NR_RRC_RELEASE "${NR_RRC_VERSION}")
 
-if(NR_RRC_RELEASE VERSION_EQUAL "16.4.1")
-  include(ASN.1/nr-rrc-16.4.1.cmake)
-elseif(NR_RRC_RELEASE VERSION_EQUAL "17.3.0")
-  include(ASN.1/nr-rrc-18.5.1.cmake)
-else()
-  message(FATAL_ERROR "unknown NR_RRC_RELEASE ${NR_RRC_RELEASE}")
-endif()
+include(ASN.1/nr-rrc-18.2.0.cmake)
+
+#if(NR_RRC_RELEASE VERSION_EQUAL "16.4.1")
+#  include(ASN.1/nr-rrc-16.4.1.cmake)
+#elseif(NR_RRC_RELEASE VERSION_EQUAL "17.3.0")
+#  include(ASN.1/nr-rrc-18.5.1.cmake)
+#else()
+#  message(FATAL_ERROR "unknown NR_RRC_RELEASE ${NR_RRC_RELEASE}")
+#endif()
 
 run_asn1c(${CMAKE_CURRENT_SOURCE_DIR}/${NR_RRC_GRAMMAR}
           "NR_"

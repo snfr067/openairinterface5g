@@ -118,6 +118,7 @@ function(run_asn1c ASN1C_GRAMMAR ASN1C_PREFIX)
   set(LOGFILE "${CMAKE_CURRENT_BINARY_DIR}/${GRAMMAR_FILE}.log")
   add_custom_command(OUTPUT ${ASN1C_OUTPUT}
     COMMAND ASN1C_PREFIX=${ASN1C_PREFIX} ${ASN1C_EXEC} ${ASN1C_OPTIONS} -D ${CMAKE_CURRENT_BINARY_DIR} ${ASN1C_GRAMMAR} > ${LOGFILE} 2>&1 || cat ${LOGFILE}
+    COMMAND python3 /home/os-willie.chuang/openairinterface5g/cmake_targets/fix_asn1_enum_collision.py ${CMAKE_CURRENT_BINARY_DIR}
     DEPENDS ${ASN1C_GRAMMAR}
     COMMENT "Generating ${ASN1C_COMMENT} from ${GRAMMAR_FILE}"
   )
