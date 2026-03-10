@@ -276,6 +276,25 @@ typedef struct NR_UE_RRC_INST_s {
   NR_NTN_Config_r17_t *target_ntncfg;
   bool process_target_ntncfg;
   notifiedFIFO_t *mac_input_nf;
+
+
+
+  struct {
+  bool enabled;                 // ncr-FwdConfig setup/release 後狀態
+  bool ap_setup;                // aperiodicFwdConfig 是否 setup
+  uint8_t beamFieldWidth;       // aperiodicBeamFieldWidth
+  uint8_t numberOfFields;       // numberOfFields
+  uint8_t referenceSCS;         // referenceSCS
+  uint8_t nRsrc;                // time resource 數
+
+    struct {
+      uint16_t slotOffsetAperiodic;
+      uint8_t  symbolOffset;
+      uint8_t  durationInSymbols;
+    } rsrc[16];
+  } ncr;
+
+
 } NR_UE_RRC_INST_t;
 
 #endif
