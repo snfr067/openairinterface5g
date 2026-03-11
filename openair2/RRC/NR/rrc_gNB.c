@@ -333,6 +333,199 @@ static void nr_rrc_transfer_protected_rrc_message(const gNB_RRC_INST *rrc,
 #endif
 }
 
+
+static int ncr_build_periodic_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                byte_array_t *dst_mcg,
+                                                long ref_scs,
+                                                long set_id,
+                                                long rsrc_id,
+                                                long beam_index,
+                                                int slot_period,
+                                                long slot_offset,
+                                                long symbol_offset,
+                                                long duration_in_symbols)
+{
+  if (!src_mcg || !src_mcg->buf || src_mcg->len <= 0 || !dst_mcg)
+    return -1;
+
+  NR_CellGroupConfig_t *cg = NULL;
+  asn_dec_rval_t dec = uper_decode_complete(NULL,
+                                            &asn_DEF_NR_CellGroupConfig,
+                                            (void **)&cg,
+                                            src_mcg->buf,
+                                            src_mcg->len);
+  if (dec.code != RC_OK || dec.consumed == 0 || !cg) {
+    LOG_E(NR_RRC, "NCR periodic: failed to decode UE->mcg CellGroupConfig\n");
+    return -1;
+  }
+
+  if (!cg->ext6)
+    cg->ext6 = CALLOC(1, sizeof(*cg->ext6));
+
+  if (!cg->ext6->ncr_FwdConfig_r18)
+    cg->ext6->ncr_FwdConfig_r18 = CALLOC(1, sizeof(*cg->ext6->ncr_FwdConfig_r18));
+
+  cg->ext6->ncr_FwdConfig_r18->present = NR_CellGroupConfig__ext6__ncr_FwdConfig_r18_PR_setup;
+
+  if (!cg->ext6->ncr_FwdConfig_r18->choice.setup)
+    cg->ext6->ncr_FwdConfig_r18->choice.setup =
+        CALLOC(1, sizeof(*cg->ext6->ncr_FwdConfig_r18->choice.setup));
+
+  NR_NCR_FwdConfig_r18_t *fwd = cg->ext6->ncr_FwdConfig_r18->choice.setup;
+
+  fwd->periodicFwdRsrcSetToAddModList_r18 = NULL;
+
+  fwd->periodicFwdRsrcSetToAddModList_r18 =
+      CALLOC(1, sizeof(*fwd->periodicFwdRsrcSetToAddModList_r18));
+
+  asn1cSequenceAdd(fwd->periodicFwdRsrcSetToAddModList_r18->list,
+                   NR_NCR_PeriodicFwdResourceSet_r18_t,
+                   set);
+
+  set->periodicFwdRsrcSetId_r18 = set_id;
+
+  set->periodicFwdRsrcToAddModList_r18 =
+      CALLOC(1, sizeof(*set->periodicFwdRsrcToAddModList_r18));
+
+  asn1cSequenceAdd(set->periodicFwdRsrcToAddModList_r18->list,
+                   NR_NCR_PeriodicFwdResource_r18_t,
+                   rsrc);
+
+  rsrc->periodicFwdRsrcId_r18 = rsrc_id;
+  rsrc->beamIndex_r18 = beam_index;
+
+  rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.present =
+      NR_NCR_PeriodicityAndOffset_r18_PR_slot;
+
+  asn1cCalloc(rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot, slot);
+
+  switch (slot_period) {
+    case 1:
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->present =
+          NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl1;
+      break;
+    case 2:
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->present =
+          NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl2;
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->choice.sl2 = slot_offset;
+      break;
+    case 4:
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->present =
+          NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl4;
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->choice.sl4 = slot_offset;
+      break;
+    case 5:
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->present =
+          NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl5;
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->choice.sl5 = slot_offset;
+      break;
+    case 8:
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->present =
+          NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl8;
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->choice.sl8 = slot_offset;
+      break;
+    case 10:
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->present =
+          NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl10;
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->choice.sl10 = slot_offset;
+      break;
+    case 16:
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->present =
+          NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl16;
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->choice.sl16 = slot_offset;
+      break;
+    case 20:
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->present =
+          NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl20;
+      rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18.choice.slot->choice.sl20 = slot_offset;
+      break;
+    default:
+      LOG_E(NR_RRC, "NCR periodic: unsupported slot_period=%d\n", slot_period);
+      ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+      return -1;
+  }
+
+  rsrc->periodicTimeRsrc_r18.symbolOffset_r18 = symbol_offset;
+  rsrc->periodicTimeRsrc_r18.durationInSymbols_r18 = duration_in_symbols;
+
+  set->referenceSCS_r18 = CALLOC(1, sizeof(*set->referenceSCS_r18));
+  *set->referenceSCS_r18 = ref_scs;
+
+  dst_mcg->len = uper_encode_to_new_buffer(&asn_DEF_NR_CellGroupConfig,
+                                           NULL,
+                                           cg,
+                                           (void **)&dst_mcg->buf);
+
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+
+  if (dst_mcg->len <= 0 || !dst_mcg->buf) {
+    LOG_E(NR_RRC, "NCR periodic: failed to encode modified CellGroupConfig\n");
+    return -1;
+  }
+
+  return 0;
+}
+
+static int ncr_build_periodic_rrc_reconfiguration(gNB_RRC_INST *rrc,
+                                                  gNB_RRC_UE_t *UE,
+                                                  byte_array_t *out_msg)
+{
+  if (!rrc || !UE || !out_msg)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+
+  /* 這裡先給一組固定測試值，之後您可再改成動態參數 */
+  const long ref_scs = NR_SubcarrierSpacing_kHz30;
+  const long set_id = 0;
+  const long rsrc_id = 0;
+  const long beam_index = 7;
+  const int slot_period = 20;
+  const long slot_offset = 0;
+  const long symbol_offset = 2;
+  const long duration_in_symbols = 4;
+
+  if (ncr_build_periodic_cgconfig_from_mcg(&UE->mcg,
+                                           &modified_mcg,
+                                           ref_scs,
+                                           set_id,
+                                           rsrc_id,
+                                           beam_index,
+                                           slot_period,
+                                           slot_offset,
+                                           symbol_offset,
+                                           duration_in_symbols) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+
+  *out_msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!out_msg->buf || out_msg->len <= 0)
+    return -1;
+
+  LOG_I(NR_RRC,
+        "NCR periodic cmd built: setId=%ld rsrcId=%ld beam=%ld slotPeriod=%d slotOffset=%ld symbolOffset=%ld duration=%ld refSCS=%ld\n",
+        set_id,
+        rsrc_id,
+        beam_index,
+        slot_period,
+        slot_offset,
+        symbol_offset,
+        duration_in_symbols,
+        ref_scs);
+
+  return 0;
+}
+
 typedef struct ncr_delayed_cmd_args_s {
   int module_id;
   sctp_assoc_t assoc_id;
@@ -355,22 +548,18 @@ static void *ncr_delayed_cmd_thread(void *arg)
 
   rrc_gNB_ue_context_t *ue_context_p = rrc_gNB_get_ue_context_by_rnti(rrc, assoc_id, rnti);
   if (!ue_context_p) {
-    LOG_W(NR_RRC, "NCR delayed cmd: UE context not found anymore (assoc_id=%d rnti=%04x)\n",
-          assoc_id, rnti);
+    LOG_W(NR_RRC,
+          "NCR delayed cmd: UE context not found anymore (assoc_id=%d rnti=%04x)\n",
+          assoc_id,
+          rnti);
     return NULL;
   }
 
   gNB_RRC_UE_t *UE = &ue_context_p->ue_context;
 
-  uint8_t xid = rrc_gNB_get_next_transaction_identifier(module_id);
-  UE->xids[xid] = RRC_DEDICATED_RECONF;
-
-  nr_rrc_reconfig_param_t params = {0};
-  params.transaction_id = xid;
-
-  byte_array_t msg = do_RRCReconfiguration(&params);
-  if (!msg.buf || msg.len <= 0) {
-    LOG_E(NR_RRC, "NCR delayed cmd: failed to build RRCReconfiguration for UE rnti=%04x\n", rnti);
+  byte_array_t msg = {0};
+  if (ncr_build_periodic_rrc_reconfiguration(rrc, UE, &msg) != 0) {
+    LOG_E(NR_RRC, "NCR delayed cmd: failed to build periodic RRCReconfiguration for UE rnti=%04x\n", rnti);
     return NULL;
   }
 
@@ -381,7 +570,7 @@ static void *ncr_delayed_cmd_thread(void *arg)
                                         msg.buf,
                                         msg.len);
 
-  LOG_I(NR_RRC, "NCR delayed cmd: sent RRCReconfiguration to UE rnti=%04x after 10 seconds\n", rnti);
+  LOG_I(NR_RRC, "NCR delayed cmd: sent Rel18 NCR periodic RRCReconfiguration to UE rnti=%04x after 10 seconds\n", rnti);
 
   free_byte_array(msg);
   return NULL;
