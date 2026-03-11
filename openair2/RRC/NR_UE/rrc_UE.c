@@ -1016,23 +1016,23 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
   if (!rrc || !cgConfig || !cgConfig->ext6 || !cgConfig->ext6->ncr_FwdConfig_r18)
     return;
 
-  // CellGroupConfig.ext6.ncr_FwdConfig_r18 is SetupRelease
   struct NR_CellGroupConfig__ext6__ncr_FwdConfig_r18 *ncr_ie = cgConfig->ext6->ncr_FwdConfig_r18;
 
   switch (ncr_ie->present) {
     case NR_CellGroupConfig__ext6__ncr_FwdConfig_r18_PR_release:
-      nr_ncr_ctx_init(rrc);
+      memset(&rrc->ncr, 0, sizeof(rrc->ncr));
+      //nr_ncr_ctx_init(&rrc->ncr);
       LOG_I(NR_RRC, "[NCR][RRC] CellGroupConfig ext6: ncr_FwdConfig_r18 RELEASE -> cease forwarding (sim)\n");
       return;
 
     case NR_CellGroupConfig__ext6__ncr_FwdConfig_r18_PR_setup: {
       NR_NCR_FwdConfig_r18_t *cfg = ncr_ie->choice.setup;
-      if (!cfg) return;
+      if (!cfg)
+        return;
 
       rrc->ncr.enabled = true;
       LOG_I(NR_RRC, "[NCR][RRC] CellGroupConfig ext6: ncr_FwdConfig_r18 SETUP -> enable forwarding (sim)\n");
 
-      // Handle aperiodicFwdConfig_r18 (SetupRelease)
       if (!cfg->aperiodicFwdConfig_r18) {
         LOG_I(NR_RRC, "[NCR][RRC] aperiodicFwdConfig_r18: not present\n");
         return;
@@ -1040,7 +1040,6 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
 
       switch (cfg->aperiodicFwdConfig_r18->present) {
         case NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_release:
-          // Only release the aperiodic part; keep enabled=true because periodic/semi-persistent may still exist
           rrc->ncr.ap_setup = false;
           rrc->ncr.beamFieldWidth = 0;
           rrc->ncr.numberOfFields = 0;
@@ -1050,41 +1049,44 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
           return;
 
         case NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_setup: {
-          struct NR_NCR_AperiodicFwdConfig_r18 *ap = cfg->aperiodicFwdConfig_r18->choice.setup;
-          if (!ap) return;
+          const NR_NCR_AperiodicFwdConfig_r18_t *ap = cfg->aperiodicFwdConfig_r18->choice.setup;
+          if (!ap)
+            return;
 
           rrc->ncr.ap_setup = true;
-          rrc->ncr.beamFieldWidth = ap->aperiodicBeamFieldWidth;
-          rrc->ncr.numberOfFields = ap->numberOfFields;
-          rrc->ncr.referenceSCS = ap->referenceSCS;
+          //rrc->ncr.beamFieldWidth = ap->aperiodicBeamFieldWidth_r18;
+          //rrc->ncr.numberOfFields = ap->numberOfFields_r18;
+          //rrc->ncr.referenceSCS = ap->referenceSCS_r18;
+	  rrc->ncr.beamFieldWidth = ap->aperiodicBeamFieldWidth_r18 ? (uint8_t)(*ap->aperiodicBeamFieldWidth_r18) : 0;
+          rrc->ncr.numberOfFields = ap->numberOfFields_r18 ? (uint8_t)(*ap->numberOfFields_r18) : 0;
+          rrc->ncr.referenceSCS = ap->referenceSCS_r18 ? (uint8_t)(*ap->referenceSCS_r18) : 0;
 
-          // Copy time resources (ToAddModList)
           rrc->ncr.nRsrc = 0;
           if (ap->aperiodicFwdTimeRsrcToAddModList_r18) {
             int cnt = ap->aperiodicFwdTimeRsrcToAddModList_r18->list.count;
             for (int i = 0; i < cnt && rrc->ncr.nRsrc < 16; i++) {
-              // Element type name depends on asn1c generation; we access fields by pointer
-              // slotOffsetAperiodic / symbolOffset / durationInSymbols are in the element
-              const void *elem_v = ap->aperiodicFwdTimeRsrcToAddModList_r18->list.array[i];
-              if (!elem_v) continue;
+              const NR_NCR_AperiodicFwdTimeResource_r18_t *e =
+                  ap->aperiodicFwdTimeRsrcToAddModList_r18->list.array[i];
+              if (!e)
+                continue;
 
-              // Cast to the generated type:
-              // In OAI/asn1c, this is typically "NR_NCR_AperiodicFwdTimeResource_r18_t"
-              const NR_NCR_AperiodicFwdTimeResource_r18_t *e = (const NR_NCR_AperiodicFwdTimeResource_r18_t *)elem_v;
-
-              rrc->ncr.rsrc[rrc->ncr.nRsrc].slotOffsetAperiodic = e->slotOffsetAperiodic;
-              rrc->ncr.rsrc[rrc->ncr.nRsrc].symbolOffset       = e->symbolOffset;
-              rrc->ncr.rsrc[rrc->ncr.nRsrc].durationInSymbols  = e->durationInSymbols;
+              rrc->ncr.rsrc[rrc->ncr.nRsrc].slotOffsetAperiodic = e->slotOffsetAperiodic_r18;
+              rrc->ncr.rsrc[rrc->ncr.nRsrc].symbolOffset = e->symbolOffset_r18;
+              rrc->ncr.rsrc[rrc->ncr.nRsrc].durationInSymbols = e->durationInSymbols_r18;
               rrc->ncr.nRsrc++;
             }
           }
 
           LOG_I(NR_RRC,
                 "[NCR][RRC] aperiodic SETUP: beamFieldWidth=%u nFields=%u refSCS=%u nRsrc=%u\n",
-                rrc->ncr.beamFieldWidth, rrc->ncr.numberOfFields, rrc->ncr.referenceSCS, rrc->ncr.nRsrc);
+                rrc->ncr.beamFieldWidth,
+                rrc->ncr.numberOfFields,
+                rrc->ncr.referenceSCS,
+                rrc->ncr.nRsrc);
 
           for (int i = 0; i < rrc->ncr.nRsrc; i++) {
-            LOG_I(NR_RRC, "[NCR][RRC] apRsrc[%d] slotOff=%u symOff=%u durSym=%u\n",
+            LOG_I(NR_RRC,
+                  "[NCR][RRC] apRsrc[%d] slotOff=%u symOff=%u durSym=%u\n",
                   i,
                   rrc->ncr.rsrc[i].slotOffsetAperiodic,
                   rrc->ncr.rsrc[i].symbolOffset,
@@ -1104,6 +1106,7 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
       return;
   }
 }
+
 
 static void nr_rrc_cellgroup_configuration(NR_UE_RRC_INST_t *rrc, NR_CellGroupConfig_t *cgConfig, int gNB_index, bool dedicatedsib1)
 {
@@ -1671,7 +1674,7 @@ static void nr_rrc_ue_process_rrcReconfiguration(NR_UE_RRC_INST_t *rrc, int gNB_
         }
       }
       if (ie->lateNonCriticalExtension) {
-        LOG_E(NR_RRC, "RRCReconfiguration includes lateNonCriticalExtension. Not handled.\n");
+        //LOG_E(NR_RRC, "RRCReconfiguration includes lateNonCriticalExtension. Not handled.\n");
       }
     } break;
     case NR_RRCReconfiguration__criticalExtensions_PR_NOTHING:
@@ -1754,6 +1757,7 @@ NR_UE_RRC_INST_t* nr_rrc_init_ue(char* uecap_file, int instance_id, int num_ant_
   NR_UE_RRC_INST_t *rrc = NR_UE_rrc_inst[instance_id];
   rrc->ue_id = instance_id;
   memset(&rrc->ncr, 0, sizeof(rrc->ncr));
+  //nr_ncr_ctx_init(&rrc->ncr);
   // nr_ncr_ctx_init(&rrc->ncr_ctx);
   // fill UE-NR-Capability @ UE-CapabilityRAT-Container here.
   rrc->selected_plmn_identity = 1;

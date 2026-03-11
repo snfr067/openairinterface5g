@@ -36,6 +36,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "5g_platform_types.h"
 #include "openair2/RRC/NR/nr_rrc_proto.h"
 #include "openair2/RRC/NR/rrc_gNB_UE_context.h"
@@ -329,6 +331,81 @@ static void nr_rrc_transfer_protected_rrc_message(const gNB_RRC_INST *rrc,
 #ifdef E2_AGENT
   E2_AGENT_SIGNAL_DL_DCCH_RRC_MSG(buffer, size, message_id);
 #endif
+}
+
+typedef struct ncr_delayed_cmd_args_s {
+  int module_id;
+  sctp_assoc_t assoc_id;
+  rnti_t rnti;
+} ncr_delayed_cmd_args_t;
+
+static void *ncr_delayed_cmd_thread(void *arg)
+{
+  ncr_delayed_cmd_args_t *a = (ncr_delayed_cmd_args_t *)arg;
+  const int module_id = a->module_id;
+  const sctp_assoc_t assoc_id = a->assoc_id;
+  const rnti_t rnti = a->rnti;
+  free(a);
+
+  sleep(10);
+
+  gNB_RRC_INST *rrc = RC.nrrrc[module_id];
+  if (!rrc)
+    return NULL;
+
+  rrc_gNB_ue_context_t *ue_context_p = rrc_gNB_get_ue_context_by_rnti(rrc, assoc_id, rnti);
+  if (!ue_context_p) {
+    LOG_W(NR_RRC, "NCR delayed cmd: UE context not found anymore (assoc_id=%d rnti=%04x)\n",
+          assoc_id, rnti);
+    return NULL;
+  }
+
+  gNB_RRC_UE_t *UE = &ue_context_p->ue_context;
+
+  uint8_t xid = rrc_gNB_get_next_transaction_identifier(module_id);
+  UE->xids[xid] = RRC_DEDICATED_RECONF;
+
+  nr_rrc_reconfig_param_t params = {0};
+  params.transaction_id = xid;
+
+  byte_array_t msg = do_RRCReconfiguration(&params);
+  if (!msg.buf || msg.len <= 0) {
+    LOG_E(NR_RRC, "NCR delayed cmd: failed to build RRCReconfiguration for UE rnti=%04x\n", rnti);
+    return NULL;
+  }
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC, "NCR delayed cmd: sent RRCReconfiguration to UE rnti=%04x after 10 seconds\n", rnti);
+
+  free_byte_array(msg);
+  return NULL;
+}
+
+static void ncr_schedule_delayed_cmd(int module_id, sctp_assoc_t assoc_id, rnti_t rnti)
+{
+  pthread_t t;
+  ncr_delayed_cmd_args_t *a = calloc(1, sizeof(*a));
+  if (!a) {
+    LOG_E(NR_RRC, "failed to allocate NCR delayed command args\n");
+    return;
+  }
+
+  a->module_id = module_id;
+  a->assoc_id = assoc_id;
+  a->rnti = rnti;
+
+  if (pthread_create(&t, NULL, ncr_delayed_cmd_thread, a) != 0) {
+    LOG_E(NR_RRC, "failed to create NCR delayed command thread\n");
+    free(a);
+    return;
+  }
+  pthread_detach(t);
 }
 
 static void rrc_gNB_CU_DU_init(gNB_RRC_INST *rrc)
@@ -2051,6 +2128,7 @@ if (!UE->ongoing_reconfiguration) {
   nr_rrc_reconfiguration_req(rrc, UE, 0, 0);
 }
 
+
   return;
 }
 
@@ -2189,6 +2267,7 @@ static int rrc_gNB_decode_dcch(gNB_RRC_INST *rrc, const f1ap_ul_rrc_message_t *m
       case NR_UL_DCCH_MessageType__c1_PR_rrcSetupComplete:
         LOG_UE_UL_EVENT(UE, "Received RRCSetupComplete (RRC_CONNECTED reached)\n");
         handle_rrcSetupComplete(rrc, UE, ul_dcch_msg->message.choice.c1->choice.rrcSetupComplete);
+        ncr_schedule_delayed_cmd(rrc->module_id, assoc_id, UE->rnti);
         break;
 
       case NR_UL_DCCH_MessageType__c1_PR_measurementReport:
