@@ -334,6 +334,113 @@ static void nr_rrc_transfer_protected_rrc_message(const gNB_RRC_INST *rrc,
 }
 
 
+static int ncr_fill_periodicity_and_offset_slot(NR_NCR_PeriodicityAndOffset_r18_t *po,
+                                                int slot_period,
+                                                long slot_offset)
+{
+  if (!po)
+    return -1;
+
+  memset(po, 0, sizeof(*po));
+  po->present = NR_NCR_PeriodicityAndOffset_r18_PR_slot;
+  asn1cCalloc(po->choice.slot, slot);
+
+  switch (slot_period) {
+    case 1:
+      po->choice.slot->present = NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl1;
+      break;
+    case 2:
+      po->choice.slot->present = NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl2;
+      po->choice.slot->choice.sl2 = slot_offset;
+      break;
+    case 4:
+      po->choice.slot->present = NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl4;
+      po->choice.slot->choice.sl4 = slot_offset;
+      break;
+    case 5:
+      po->choice.slot->present = NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl5;
+      po->choice.slot->choice.sl5 = slot_offset;
+      break;
+    case 8:
+      po->choice.slot->present = NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl8;
+      po->choice.slot->choice.sl8 = slot_offset;
+      break;
+    case 10:
+      po->choice.slot->present = NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl10;
+      po->choice.slot->choice.sl10 = slot_offset;
+      break;
+    case 16:
+      po->choice.slot->present = NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl16;
+      po->choice.slot->choice.sl16 = slot_offset;
+      break;
+    case 20:
+      po->choice.slot->present = NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl20;
+      po->choice.slot->choice.sl20 = slot_offset;
+      break;
+    default:
+      LOG_E(NR_RRC, "NCR: unsupported slot_period=%d\n", slot_period);
+      return -1;
+  }
+
+  return 0;
+}
+
+static int ncr_decode_mcg_and_prepare_fwd(const byte_array_t *src_mcg,
+                                          NR_CellGroupConfig_t **out_cg,
+                                          NR_NCR_FwdConfig_r18_t **out_fwd)
+{
+  if (!src_mcg || !src_mcg->buf || src_mcg->len <= 0 || !out_cg || !out_fwd)
+    return -1;
+
+  NR_CellGroupConfig_t *cg = NULL;
+  asn_dec_rval_t dec = uper_decode_complete(NULL,
+                                            &asn_DEF_NR_CellGroupConfig,
+                                            (void **)&cg,
+                                            src_mcg->buf,
+                                            src_mcg->len);
+  if (dec.code != RC_OK || dec.consumed == 0 || !cg) {
+    LOG_E(NR_RRC, "NCR: failed to decode UE->mcg CellGroupConfig\n");
+    return -1;
+  }
+
+  if (!cg->ext6)
+    cg->ext6 = CALLOC(1, sizeof(*cg->ext6));
+
+  if (!cg->ext6->ncr_FwdConfig_r18)
+    cg->ext6->ncr_FwdConfig_r18 = CALLOC(1, sizeof(*cg->ext6->ncr_FwdConfig_r18));
+
+  cg->ext6->ncr_FwdConfig_r18->present =
+      NR_CellGroupConfig__ext6__ncr_FwdConfig_r18_PR_setup;
+
+  if (!cg->ext6->ncr_FwdConfig_r18->choice.setup)
+    cg->ext6->ncr_FwdConfig_r18->choice.setup =
+        CALLOC(1, sizeof(*cg->ext6->ncr_FwdConfig_r18->choice.setup));
+
+  *out_cg = cg;
+  *out_fwd = cg->ext6->ncr_FwdConfig_r18->choice.setup;
+  return 0;
+}
+
+static int ncr_encode_modified_mcg(NR_CellGroupConfig_t *cg,
+                                   byte_array_t *dst_mcg,
+                                   const char *tag)
+{
+  if (!cg || !dst_mcg)
+    return -1;
+
+  dst_mcg->len = uper_encode_to_new_buffer(&asn_DEF_NR_CellGroupConfig,
+                                           NULL,
+                                           cg,
+                                           (void **)&dst_mcg->buf);
+
+  if (dst_mcg->len <= 0 || !dst_mcg->buf) {
+    LOG_E(NR_RRC, "NCR %s: failed to encode modified CellGroupConfig\n", tag);
+    return -1;
+  }
+
+  return 0;
+}
+
 static int ncr_build_periodic_cgconfig_from_mcg(const byte_array_t *src_mcg,
                                                 byte_array_t *dst_mcg,
                                                 long ref_scs,
@@ -466,6 +573,121 @@ static int ncr_build_periodic_cgconfig_from_mcg(const byte_array_t *src_mcg,
   return 0;
 }
 
+
+static int ncr_build_aperiodic_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                 byte_array_t *dst_mcg,
+                                                 long ref_scs,
+                                                 long time_rsrc_id,
+                                                 long slot_offset_aperiodic,
+                                                 long symbol_offset,
+                                                 long duration_in_symbols,
+                                                 long beam_field_width,
+                                                 long number_of_fields)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  NR_NCR_FwdConfig_r18_t *fwd = NULL;
+
+  if (ncr_decode_mcg_and_prepare_fwd(src_mcg, &cg, &fwd) != 0)
+    return -1;
+
+  if (!fwd->aperiodicFwdConfig_r18)
+    fwd->aperiodicFwdConfig_r18 = CALLOC(1, sizeof(*fwd->aperiodicFwdConfig_r18));
+
+  fwd->aperiodicFwdConfig_r18->present =
+      NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_setup;
+
+  if (!fwd->aperiodicFwdConfig_r18->choice.setup)
+    fwd->aperiodicFwdConfig_r18->choice.setup =
+        CALLOC(1, sizeof(*fwd->aperiodicFwdConfig_r18->choice.setup));
+
+  NR_NCR_AperiodicFwdConfig_r18_t *ap = fwd->aperiodicFwdConfig_r18->choice.setup;
+
+  if (!ap->aperiodicFwdTimeRsrcToAddModList_r18)
+    ap->aperiodicFwdTimeRsrcToAddModList_r18 =
+        CALLOC(1, sizeof(*ap->aperiodicFwdTimeRsrcToAddModList_r18));
+
+  asn1cSequenceAdd(ap->aperiodicFwdTimeRsrcToAddModList_r18->list,
+                   NR_NCR_AperiodicFwdTimeResource_r18_t,
+                   rsrc);
+
+  rsrc->aperiodicFwdTimeRsrcId_r18 = time_rsrc_id;
+  rsrc->slotOffsetAperiodic_r18 = slot_offset_aperiodic;
+  rsrc->symbolOffset_r18 = symbol_offset;
+  rsrc->durationInSymbols_r18 = duration_in_symbols;
+
+  if (!ap->referenceSCS_r18)
+    ap->referenceSCS_r18 = CALLOC(1, sizeof(*ap->referenceSCS_r18));
+  *ap->referenceSCS_r18 = ref_scs;
+
+  if (!ap->aperiodicBeamFieldWidth_r18)
+    ap->aperiodicBeamFieldWidth_r18 = CALLOC(1, sizeof(*ap->aperiodicBeamFieldWidth_r18));
+  *ap->aperiodicBeamFieldWidth_r18 = beam_field_width;
+
+  if (!ap->numberOfFields_r18)
+    ap->numberOfFields_r18 = CALLOC(1, sizeof(*ap->numberOfFields_r18));
+  *ap->numberOfFields_r18 = number_of_fields;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "aperiodic");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
+
+static int ncr_build_semi_persistent_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                       byte_array_t *dst_mcg,
+                                                       long ref_scs,
+                                                       long set_id,
+                                                       long rsrc_id,
+                                                       long beam_index,
+                                                       int slot_period,
+                                                       long slot_offset,
+                                                       long symbol_offset,
+                                                       long duration_in_symbols)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  NR_NCR_FwdConfig_r18_t *fwd = NULL;
+
+  if (ncr_decode_mcg_and_prepare_fwd(src_mcg, &cg, &fwd) != 0)
+    return -1;
+
+  fwd->semiPersistentFwdRsrcSetToAddModList_r18 =
+      CALLOC(1, sizeof(*fwd->semiPersistentFwdRsrcSetToAddModList_r18));
+
+  asn1cSequenceAdd(fwd->semiPersistentFwdRsrcSetToAddModList_r18->list,
+                   NR_NCR_SemiPersistentFwdResourceSet_r18_t,
+                   set);
+
+  set->semiPersistentFwdRsrcSetId_r18 = set_id;
+
+  set->semiPersistentFwdRsrcToAddModList_r18 =
+      CALLOC(1, sizeof(*set->semiPersistentFwdRsrcToAddModList_r18));
+
+  asn1cSequenceAdd(set->semiPersistentFwdRsrcToAddModList_r18->list,
+                   NR_NCR_SemiPersistentFwdResource_r18_t,
+                   rsrc);
+
+  rsrc->semiPersistentFwdRsrcId_r18 = rsrc_id;
+  rsrc->beamIndex_r18 = beam_index;
+
+  if (ncr_fill_periodicity_and_offset_slot(
+          &rsrc->semiPersistentTimeRsrc_r18.periodicityAndOffset_r18,
+          slot_period,
+          slot_offset) != 0) {
+    ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+    return -1;
+  }
+
+  rsrc->semiPersistentTimeRsrc_r18.symbolOffset_r18 = symbol_offset;
+  rsrc->semiPersistentTimeRsrc_r18.durationInSymbols_r18 = duration_in_symbols;
+
+  set->referenceSCS_r18 = CALLOC(1, sizeof(*set->referenceSCS_r18));
+  *set->referenceSCS_r18 = ref_scs;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "semi-persistent");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
+
+
 static int ncr_build_periodic_rrc_reconfiguration(gNB_RRC_INST *rrc,
                                                   gNB_RRC_UE_t *UE,
                                                   byte_array_t *out_msg)
@@ -526,11 +748,237 @@ static int ncr_build_periodic_rrc_reconfiguration(gNB_RRC_INST *rrc,
   return 0;
 }
 
+static int ncr_build_aperiodic_rrc_reconfiguration(gNB_RRC_INST *rrc,
+                                                   gNB_RRC_UE_t *UE,
+                                                   byte_array_t *out_msg)
+{
+  if (!rrc || !UE || !out_msg)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+
+  const long ref_scs = NR_SubcarrierSpacing_kHz30;
+  const long time_rsrc_id = 0;
+  const long slot_offset_aperiodic = 6;
+  const long symbol_offset = 2;
+  const long duration_in_symbols = 4;
+  const long beam_field_width = 2;
+  const long number_of_fields = 1;
+
+  if (ncr_build_aperiodic_cgconfig_from_mcg(&UE->mcg,
+                                            &modified_mcg,
+                                            ref_scs,
+                                            time_rsrc_id,
+                                            slot_offset_aperiodic,
+                                            symbol_offset,
+                                            duration_in_symbols,
+                                            beam_field_width,
+                                            number_of_fields) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  *out_msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!out_msg->buf || out_msg->len <= 0)
+    return -1;
+
+  LOG_I(NR_RRC,
+        "NCR aperiodic cmd built: rsrcId=%ld slotOffsetAperiodic=%ld symbolOffset=%ld duration=%ld beamFieldWidth=%ld nFields=%ld refSCS=%ld\n",
+        time_rsrc_id,
+        slot_offset_aperiodic,
+        symbol_offset,
+        duration_in_symbols,
+        beam_field_width,
+        number_of_fields,
+        ref_scs);
+
+  return 0;
+}
+
+static int ncr_build_semi_persistent_rrc_reconfiguration(gNB_RRC_INST *rrc,
+                                                         gNB_RRC_UE_t *UE,
+                                                         byte_array_t *out_msg)
+{
+  if (!rrc || !UE || !out_msg)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+
+  const long ref_scs = NR_SubcarrierSpacing_kHz30;
+  const long set_id = 1;
+  const long rsrc_id = 0;
+  const long beam_index = 9;
+  const int  slot_period = 20;
+  const long slot_offset = 5;
+  const long symbol_offset = 2;
+  const long duration_in_symbols = 4;
+
+  if (ncr_build_semi_persistent_cgconfig_from_mcg(&UE->mcg,
+                                                  &modified_mcg,
+                                                  ref_scs,
+                                                  set_id,
+                                                  rsrc_id,
+                                                  beam_index,
+                                                  slot_period,
+                                                  slot_offset,
+                                                  symbol_offset,
+                                                  duration_in_symbols) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  *out_msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!out_msg->buf || out_msg->len <= 0)
+    return -1;
+
+  LOG_I(NR_RRC,
+        "NCR semi-persistent cmd built: setId=%ld rsrcId=%ld beam=%ld slotPeriod=%d slotOffset=%ld symbolOffset=%ld duration=%ld refSCS=%ld\n",
+        set_id,
+        rsrc_id,
+        beam_index,
+        slot_period,
+        slot_offset,
+        symbol_offset,
+        duration_in_symbols,
+        ref_scs);
+
+  return 0;
+}
+
 typedef struct ncr_delayed_cmd_args_s {
   int module_id;
   sctp_assoc_t assoc_id;
   rnti_t rnti;
 } ncr_delayed_cmd_args_t;
+
+static void *ncr_delayed_aperiodic_cmd_thread(void *arg)
+{
+  ncr_delayed_cmd_args_t *a = (ncr_delayed_cmd_args_t *)arg;
+  const int module_id = a->module_id;
+  const sctp_assoc_t assoc_id = a->assoc_id;
+  const rnti_t rnti = a->rnti;
+  free(a);
+
+  sleep(15);
+
+  gNB_RRC_INST *rrc = RC.nrrrc[module_id];
+  if (!rrc)
+    return NULL;
+
+  rrc_gNB_ue_context_t *ue_context_p = rrc_gNB_get_ue_context_by_rnti(rrc, assoc_id, rnti);
+  if (!ue_context_p)
+    return NULL;
+
+  gNB_RRC_UE_t *UE = &ue_context_p->ue_context;
+  byte_array_t msg = {0};
+
+  if (ncr_build_aperiodic_rrc_reconfiguration(rrc, UE, &msg) != 0) {
+    LOG_E(NR_RRC, "NCR delayed aperiodic cmd: failed for UE rnti=%04x\n", rnti);
+    return NULL;
+  }
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC, "NCR delayed aperiodic cmd: sent Rel18 NCR aperiodic RRCReconfiguration to UE rnti=%04x\n", rnti);
+  free_byte_array(msg);
+  return NULL;
+}
+
+static void *ncr_delayed_semi_persistent_cmd_thread(void *arg)
+{
+  ncr_delayed_cmd_args_t *a = (ncr_delayed_cmd_args_t *)arg;
+  const int module_id = a->module_id;
+  const sctp_assoc_t assoc_id = a->assoc_id;
+  const rnti_t rnti = a->rnti;
+  free(a);
+
+  sleep(20);
+
+  gNB_RRC_INST *rrc = RC.nrrrc[module_id];
+  if (!rrc)
+    return NULL;
+
+  rrc_gNB_ue_context_t *ue_context_p = rrc_gNB_get_ue_context_by_rnti(rrc, assoc_id, rnti);
+  if (!ue_context_p)
+    return NULL;
+
+  gNB_RRC_UE_t *UE = &ue_context_p->ue_context;
+  byte_array_t msg = {0};
+
+  if (ncr_build_semi_persistent_rrc_reconfiguration(rrc, UE, &msg) != 0) {
+    LOG_E(NR_RRC, "NCR delayed semi-persistent cmd: failed for UE rnti=%04x\n", rnti);
+    return NULL;
+  }
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC, "NCR delayed semi-persistent cmd: sent Rel18 NCR semi-persistent RRCReconfiguration to UE rnti=%04x\n", rnti);
+  free_byte_array(msg);
+  return NULL;
+}
+
+static void ncr_schedule_delayed_aperiodic_cmd(int module_id, sctp_assoc_t assoc_id, rnti_t rnti)
+{
+  pthread_t t;
+  ncr_delayed_cmd_args_t *a = calloc(1, sizeof(*a));
+  if (!a)
+    return;
+
+  a->module_id = module_id;
+  a->assoc_id = assoc_id;
+  a->rnti = rnti;
+
+  if (pthread_create(&t, NULL, ncr_delayed_aperiodic_cmd_thread, a) != 0) {
+    free(a);
+    return;
+  }
+  pthread_detach(t);
+}
+
+static void ncr_schedule_delayed_semi_persistent_cmd(int module_id, sctp_assoc_t assoc_id, rnti_t rnti)
+{
+  pthread_t t;
+  ncr_delayed_cmd_args_t *a = calloc(1, sizeof(*a));
+  if (!a)
+    return;
+
+  a->module_id = module_id;
+  a->assoc_id = assoc_id;
+  a->rnti = rnti;
+
+  if (pthread_create(&t, NULL, ncr_delayed_semi_persistent_cmd_thread, a) != 0) {
+    free(a);
+    return;
+  }
+  pthread_detach(t);
+}
+
 
 static void *ncr_delayed_cmd_thread(void *arg)
 {
@@ -2454,10 +2902,13 @@ static int rrc_gNB_decode_dcch(gNB_RRC_INST *rrc, const f1ap_ul_rrc_message_t *m
         break;
 
       case NR_UL_DCCH_MessageType__c1_PR_rrcSetupComplete:
-        LOG_UE_UL_EVENT(UE, "Received RRCSetupComplete (RRC_CONNECTED reached)\n");
-        handle_rrcSetupComplete(rrc, UE, ul_dcch_msg->message.choice.c1->choice.rrcSetupComplete);
-        ncr_schedule_delayed_cmd(rrc->module_id, assoc_id, UE->rnti);
-        break;
+          LOG_UE_UL_EVENT(UE, "Received RRCSetupComplete (RRC_CONNECTED reached)\n");
+          handle_rrcSetupComplete(rrc, UE, ul_dcch_msg->message.choice.c1->choice.rrcSetupComplete);
+
+          ncr_schedule_delayed_cmd(rrc->module_id, assoc_id, UE->rnti);                   // periodic: 10s
+          ncr_schedule_delayed_aperiodic_cmd(rrc->module_id, assoc_id, UE->rnti);         // aperiodic: 15s
+          ncr_schedule_delayed_semi_persistent_cmd(rrc->module_id, assoc_id, UE->rnti);   // semi-persistent: 20s
+          break;
 
       case NR_UL_DCCH_MessageType__c1_PR_measurementReport:
         if (ul_dcch_msg->message.choice.c1->choice.measurementReport != NULL) {

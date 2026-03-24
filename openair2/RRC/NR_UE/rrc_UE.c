@@ -1010,6 +1010,40 @@ static void nr_rrc_process_reconfigurationWithSync(NR_UE_RRC_INST_t *rrc,
   }
 }
 
+static void ncr_decode_slot_periodicity_and_offset(const NR_NCR_PeriodicityAndOffset_r18_t *po,
+                                                   long *slot_period,
+                                                   long *slot_offset)
+{
+  *slot_period = -1;
+  *slot_offset = -1;
+
+  if (!po)
+    return;
+
+  if (po->present != NR_NCR_PeriodicityAndOffset_r18_PR_slot || !po->choice.slot)
+    return;
+
+  switch (po->choice.slot->present) {
+    case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl1:
+      *slot_period = 1;  *slot_offset = 0; break;
+    case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl2:
+      *slot_period = 2;  *slot_offset = po->choice.slot->choice.sl2; break;
+    case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl4:
+      *slot_period = 4;  *slot_offset = po->choice.slot->choice.sl4; break;
+    case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl5:
+      *slot_period = 5;  *slot_offset = po->choice.slot->choice.sl5; break;
+    case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl8:
+      *slot_period = 8;  *slot_offset = po->choice.slot->choice.sl8; break;
+    case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl10:
+      *slot_period = 10; *slot_offset = po->choice.slot->choice.sl10; break;
+    case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl16:
+      *slot_period = 16; *slot_offset = po->choice.slot->choice.sl16; break;
+    case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl20:
+      *slot_period = 20; *slot_offset = po->choice.slot->choice.sl20; break;
+    default:
+      break;
+  }
+}
 
 static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGroupConfig_t *cgConfig)
 {
@@ -1030,92 +1064,147 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
 
   NR_NCR_FwdConfig_r18_t *cfg = ncr_ie->choice.setup;
 
+  /* ---------------- periodic ---------------- */
   if (!cfg->periodicFwdRsrcSetToAddModList_r18) {
     LOG_I(NR_RRC, "[NCR][UE] no periodicFwdRsrcSetToAddModList_r18\n");
-    return;
+  } else {
+    for (int i = 0; i < cfg->periodicFwdRsrcSetToAddModList_r18->list.count; i++) {
+      NR_NCR_PeriodicFwdResourceSet_r18_t *set =
+          cfg->periodicFwdRsrcSetToAddModList_r18->list.array[i];
+      if (!set)
+        continue;
+
+      long ref_scs = -1;
+      if (set->referenceSCS_r18)
+        ref_scs = *set->referenceSCS_r18;
+
+      LOG_I(NR_RRC,
+            "[NCR][UE] PeriodicSet: setId=%ld refSCS=%ld\n",
+            set->periodicFwdRsrcSetId_r18,
+            ref_scs);
+
+      if (!set->periodicFwdRsrcToAddModList_r18)
+        continue;
+
+      for (int j = 0; j < set->periodicFwdRsrcToAddModList_r18->list.count; j++) {
+        NR_NCR_PeriodicFwdResource_r18_t *rsrc =
+            set->periodicFwdRsrcToAddModList_r18->list.array[j];
+        if (!rsrc)
+          continue;
+
+        long slot_period = -1;
+        long slot_offset = -1;
+        ncr_decode_slot_periodicity_and_offset(
+            &rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18,
+            &slot_period,
+            &slot_offset);
+
+        LOG_I(NR_RRC,
+              "[NCR][UE] PeriodicRsrc: setId=%ld rsrcId=%ld beamIndex=%ld slotPeriod=%ld slotOffset=%ld symbolOffset=%ld durationInSymbols=%ld\n",
+              set->periodicFwdRsrcSetId_r18,
+              rsrc->periodicFwdRsrcId_r18,
+              rsrc->beamIndex_r18,
+              slot_period,
+              slot_offset,
+              rsrc->periodicTimeRsrc_r18.symbolOffset_r18,
+              rsrc->periodicTimeRsrc_r18.durationInSymbols_r18);
+      }
+    }
   }
 
-  for (int i = 0; i < cfg->periodicFwdRsrcSetToAddModList_r18->list.count; i++) {
-    NR_NCR_PeriodicFwdResourceSet_r18_t *set =
-        cfg->periodicFwdRsrcSetToAddModList_r18->list.array[i];
-    if (!set)
-      continue;
+  /* ---------------- aperiodic ---------------- */
+  if (!cfg->aperiodicFwdConfig_r18) {
+    LOG_I(NR_RRC, "[NCR][UE] no aperiodicFwdConfig_r18\n");
+  } else if (cfg->aperiodicFwdConfig_r18->present ==
+             NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_release) {
+    LOG_I(NR_RRC, "[NCR][UE] AperiodicCfg RELEASE\n");
+  } else if (cfg->aperiodicFwdConfig_r18->present ==
+                 NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_setup &&
+             cfg->aperiodicFwdConfig_r18->choice.setup) {
+
+    NR_NCR_AperiodicFwdConfig_r18_t *ap = cfg->aperiodicFwdConfig_r18->choice.setup;
 
     long ref_scs = -1;
-    if (set->referenceSCS_r18)
-      ref_scs = *set->referenceSCS_r18;
+    long beam_field_width = -1;
+    long number_of_fields = -1;
+
+    if (ap->referenceSCS_r18)
+      ref_scs = *ap->referenceSCS_r18;
+    if (ap->aperiodicBeamFieldWidth_r18)
+      beam_field_width = *ap->aperiodicBeamFieldWidth_r18;
+    if (ap->numberOfFields_r18)
+      number_of_fields = *ap->numberOfFields_r18;
 
     LOG_I(NR_RRC,
-          "[NCR][UE] PeriodicSet: setId=%ld refSCS=%ld\n",
-          set->periodicFwdRsrcSetId_r18,
-          ref_scs);
+          "[NCR][UE] AperiodicCfg: refSCS=%ld beamFieldWidth=%ld numberOfFields=%ld\n",
+          ref_scs,
+          beam_field_width,
+          number_of_fields);
 
-    if (!set->periodicFwdRsrcToAddModList_r18)
-      continue;
-
-    for (int j = 0; j < set->periodicFwdRsrcToAddModList_r18->list.count; j++) {
-      NR_NCR_PeriodicFwdResource_r18_t *rsrc =
-          set->periodicFwdRsrcToAddModList_r18->list.array[j];
+    for (int i = 0; i < ap->aperiodicFwdTimeRsrcToAddModList_r18->list.count; i++) {
+      NR_NCR_AperiodicFwdTimeResource_r18_t *rsrc =
+          ap->aperiodicFwdTimeRsrcToAddModList_r18->list.array[i];
       if (!rsrc)
         continue;
 
-      const NR_NCR_PeriodicityAndOffset_r18_t *po =
-          &rsrc->periodicTimeRsrc_r18.periodicityAndOffset_r18;
+      LOG_I(NR_RRC,
+            "[NCR][UE] AperiodicTimeRsrc: rsrcId=%ld slotOffsetAperiodic=%ld symbolOffset=%ld durationInSymbols=%ld\n",
+            rsrc->aperiodicFwdTimeRsrcId_r18,
+            rsrc->slotOffsetAperiodic_r18,
+            rsrc->symbolOffset_r18,
+            rsrc->durationInSymbols_r18);
+    }
+  }
 
-      long slot_period = -1;
-      long slot_offset = -1;
+  /* ---------------- semi-persistent ---------------- */
+  if (!cfg->semiPersistentFwdRsrcSetToAddModList_r18) {
+    LOG_I(NR_RRC, "[NCR][UE] no semiPersistentFwdRsrcSetToAddModList_r18\n");
+  } else {
+    for (int i = 0; i < cfg->semiPersistentFwdRsrcSetToAddModList_r18->list.count; i++) {
+      NR_NCR_SemiPersistentFwdResourceSet_r18_t *set =
+          cfg->semiPersistentFwdRsrcSetToAddModList_r18->list.array[i];
+      if (!set)
+        continue;
 
-      if (po->present == NR_NCR_PeriodicityAndOffset_r18_PR_slot) {
-        switch (po->choice.slot->present) {
-          case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl1:
-            slot_period = 1;
-            slot_offset = 0;
-            break;
-          case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl2:
-            slot_period = 2;
-            slot_offset = po->choice.slot->choice.sl2;
-            break;
-          case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl4:
-            slot_period = 4;
-            slot_offset = po->choice.slot->choice.sl4;
-            break;
-          case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl5:
-            slot_period = 5;
-            slot_offset = po->choice.slot->choice.sl5;
-            break;
-          case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl8:
-            slot_period = 8;
-            slot_offset = po->choice.slot->choice.sl8;
-            break;
-          case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl10:
-            slot_period = 10;
-            slot_offset = po->choice.slot->choice.sl10;
-            break;
-          case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl16:
-            slot_period = 16;
-            slot_offset = po->choice.slot->choice.sl16;
-            break;
-          case NR_NCR_SlotPeriodicityAndSlotOffset_r18_PR_sl20:
-            slot_period = 20;
-            slot_offset = po->choice.slot->choice.sl20;
-            break;
-          default:
-            break;
-        }
-      }
+      long ref_scs = -1;
+      if (set->referenceSCS_r18)
+        ref_scs = *set->referenceSCS_r18;
 
       LOG_I(NR_RRC,
-            "[NCR][UE] PeriodicRsrc: setId=%ld rsrcId=%ld beamIndex=%ld slotPeriod=%ld slotOffset=%ld symbolOffset=%ld durationInSymbols=%ld\n",
-            set->periodicFwdRsrcSetId_r18,
-            rsrc->periodicFwdRsrcId_r18,
-            rsrc->beamIndex_r18,
-            slot_period,
-            slot_offset,
-            rsrc->periodicTimeRsrc_r18.symbolOffset_r18,
-            rsrc->periodicTimeRsrc_r18.durationInSymbols_r18);
+            "[NCR][UE] SemiPersistentSet: setId=%ld refSCS=%ld\n",
+            set->semiPersistentFwdRsrcSetId_r18,
+            ref_scs);
+
+      if (!set->semiPersistentFwdRsrcToAddModList_r18)
+        continue;
+
+      for (int j = 0; j < set->semiPersistentFwdRsrcToAddModList_r18->list.count; j++) {
+        NR_NCR_SemiPersistentFwdResource_r18_t *rsrc =
+            set->semiPersistentFwdRsrcToAddModList_r18->list.array[j];
+        if (!rsrc)
+          continue;
+
+        long slot_period = -1;
+        long slot_offset = -1;
+        ncr_decode_slot_periodicity_and_offset(
+            &rsrc->semiPersistentTimeRsrc_r18.periodicityAndOffset_r18,
+            &slot_period,
+            &slot_offset);
+
+        LOG_I(NR_RRC,
+              "[NCR][UE] SemiPersistentRsrc: setId=%ld rsrcId=%ld beamIndex=%ld slotPeriod=%ld slotOffset=%ld symbolOffset=%ld durationInSymbols=%ld\n",
+              set->semiPersistentFwdRsrcSetId_r18,
+              rsrc->semiPersistentFwdRsrcId_r18,
+              rsrc->beamIndex_r18,
+              slot_period,
+              slot_offset,
+              rsrc->semiPersistentTimeRsrc_r18.symbolOffset_r18,
+              rsrc->semiPersistentTimeRsrc_r18.durationInSymbols_r18);
+      }
     }
   }
 }
+
 
 static void nr_rrc_cellgroup_configuration(NR_UE_RRC_INST_t *rrc, NR_CellGroupConfig_t *cgConfig, int gNB_index, bool dedicatedsib1)
 {
