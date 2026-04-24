@@ -38,6 +38,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include "5g_platform_types.h"
 #include "openair2/RRC/NR/nr_rrc_proto.h"
 #include "openair2/RRC/NR/rrc_gNB_UE_context.h"
@@ -102,6 +103,7 @@
 #include "alg/find.h"
 #include "NR_HandoverCommand.h"
 #include "openair2/SDAP/nr_sdap/nr_sdap_configuration.h"
+#include "common/utils/telnetsrv/telnetsrv.h"
 
 #ifdef E2_AGENT
 #include "openair2/E2AP/RAN_FUNCTION/O-RAN/ran_func_rc_extern.h"
@@ -861,6 +863,512 @@ static int ncr_build_semi_persistent_rrc_reconfiguration(gNB_RRC_INST *rrc,
   return 0;
 }
 
+
+static bool ncr_telnet_get_long(const char *cmdbuff, const char *key, long *out)
+{
+  if (!cmdbuff || !key || !out)
+    return false;
+
+  char *dup = strdup(cmdbuff);
+  if (!dup)
+    return false;
+
+  const size_t keylen = strlen(key);
+  bool found = false;
+  char *saveptr = NULL;
+
+  for (char *tok = strtok_r(dup, " ", &saveptr);
+       tok != NULL;
+       tok = strtok_r(NULL, " ", &saveptr)) {
+
+    if (strncmp(tok, key, keylen) == 0 && tok[keylen] == '=') {
+      char *val = tok + keylen + 1;
+
+      /* trim trailing CR/LF/TAB/SPACE */
+      val[strcspn(val, "\r\n\t ")] = '\0';
+
+      char *endptr = NULL;
+      long v = strtol(val, &endptr, 0);
+
+      if (endptr != val && *endptr == '\0') {
+        *out = v;
+        found = true;
+      }
+      break;
+    }
+  }
+
+  free(dup);
+  return found;
+}
+
+static long ncr_telnet_get_long_or(const char *cmdbuff, const char *key, long defval)
+{
+  long v = defval;
+  (void)ncr_telnet_get_long(cmdbuff, key, &v);
+  return v;
+}
+
+static rrc_gNB_ue_context_t *ncr_telnet_find_ue(gNB_RRC_INST *rrc, rnti_t rnti)
+{
+  if (!rrc)
+    return NULL;
+
+  rrc_gNB_ue_context_t *ue_context_p = rrc_gNB_get_ue_context_by_rnti(rrc, -1, rnti);
+  if (!ue_context_p)
+    ue_context_p = rrc_gNB_get_ue_context_by_rnti_any_du(rrc, rnti);
+  return ue_context_p;
+}
+
+static int ncr_telnet_send_periodic(gNB_RRC_INST *rrc,
+                                    gNB_RRC_UE_t *UE,
+                                    long ref_scs,
+                                    long set_id,
+                                    long rsrc_id,
+                                    long beam_index,
+                                    int slot_period,
+                                    long slot_offset,
+                                    long symbol_offset,
+                                    long duration_in_symbols)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_periodic_cgconfig_from_mcg(&UE->mcg,
+                                           &modified_mcg,
+                                           ref_scs,
+                                           set_id,
+                                           rsrc_id,
+                                           beam_index,
+                                           slot_period,
+                                           slot_offset,
+                                           symbol_offset,
+                                           duration_in_symbols) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC,
+        "NCR telnet periodic sent: setId=%ld rsrcId=%ld beam=%ld slotPeriod=%d slotOffset=%ld symbolOffset=%ld duration=%ld refSCS=%ld\n",
+        set_id,
+        rsrc_id,
+        beam_index,
+        slot_period,
+        slot_offset,
+        symbol_offset,
+        duration_in_symbols,
+        ref_scs);
+
+  free_byte_array(msg);
+  return 0;
+}
+
+static int ncr_telnet_send_aperiodic(gNB_RRC_INST *rrc,
+                                     gNB_RRC_UE_t *UE,
+                                     long ref_scs,
+                                     long time_rsrc_id,
+                                     long slot_offset_aperiodic,
+                                     long symbol_offset,
+                                     long duration_in_symbols,
+                                     long beam_field_width,
+                                     long number_of_fields)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_aperiodic_cgconfig_from_mcg(&UE->mcg,
+                                            &modified_mcg,
+                                            ref_scs,
+                                            time_rsrc_id,
+                                            slot_offset_aperiodic,
+                                            symbol_offset,
+                                            duration_in_symbols,
+                                            beam_field_width,
+                                            number_of_fields) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC,
+        "NCR telnet aperiodic sent: rsrcId=%ld slotOffsetAperiodic=%ld symbolOffset=%ld duration=%ld beamFieldWidth=%ld numberOfFields=%ld refSCS=%ld\n",
+        time_rsrc_id,
+        slot_offset_aperiodic,
+        symbol_offset,
+        duration_in_symbols,
+        beam_field_width,
+        number_of_fields,
+        ref_scs);
+
+  free_byte_array(msg);
+  return 0;
+}
+
+static int ncr_telnet_send_semi_persistent(gNB_RRC_INST *rrc,
+                                           gNB_RRC_UE_t *UE,
+                                           long ref_scs,
+                                           long set_id,
+                                           long rsrc_id,
+                                           long beam_index,
+                                           int slot_period,
+                                           long slot_offset,
+                                           long symbol_offset,
+                                           long duration_in_symbols)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_semi_persistent_cgconfig_from_mcg(&UE->mcg,
+                                                  &modified_mcg,
+                                                  ref_scs,
+                                                  set_id,
+                                                  rsrc_id,
+                                                  beam_index,
+                                                  slot_period,
+                                                  slot_offset,
+                                                  symbol_offset,
+                                                  duration_in_symbols) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC,
+        "NCR telnet semi-persistent sent: setId=%ld rsrcId=%ld beam=%ld slotPeriod=%d slotOffset=%ld symbolOffset=%ld duration=%ld refSCS=%ld\n",
+        set_id,
+        rsrc_id,
+        beam_index,
+        slot_period,
+        slot_offset,
+        symbol_offset,
+        duration_in_symbols,
+        ref_scs);
+
+  free_byte_array(msg);
+  return 0;
+}
+
+static int ncr_telnet_periodic_cmd(char *cmdbuff, int debug, telnet_printfunc_t prnt)
+{
+  (void)debug;
+  LOG_I(NR_RRC, "NCR telnet periodic handler entered, cmdbuff=%s\n", cmdbuff ? cmdbuff : "(null)");
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long ref_scs = ncr_telnet_get_long_or(cmdbuff, "refscs", NR_SubcarrierSpacing_kHz30);
+  long rnti_l = 0, set_id = 0, rsrc_id = 0, beam = 0, period = 0, offset = 0, sym = 0, dur = 0;
+
+
+if (!cmdbuff ||
+    !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l) ||
+    !ncr_telnet_get_long(cmdbuff, "set", &set_id) ||
+    !ncr_telnet_get_long(cmdbuff, "rsrc", &rsrc_id) ||
+    !ncr_telnet_get_long(cmdbuff, "beam", &beam) ||
+    !ncr_telnet_get_long(cmdbuff, "period", &period) ||
+    !ncr_telnet_get_long(cmdbuff, "offset", &offset) ||
+    !ncr_telnet_get_long(cmdbuff, "sym", &sym) ||
+    !ncr_telnet_get_long(cmdbuff, "dur", &dur)) {
+  LOG_E(NR_RRC, "NCR telnet periodic: parameter parse failed, cmdbuff=%s\n", cmdbuff ? cmdbuff : "(null)");
+  prnt("usage: ncr periodic mod=<0> rnti=<0x1234> [refscs=1] set=<id> rsrc=<id> beam=<idx> period=<1|2|4|5|8|10|16|20> offset=<n> sym=<n> dur=<n>\n");
+  return 0;
+}
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    LOG_E(NR_RRC, "NCR telnet periodic: UE not found rnti=0x%lx\n", rnti_l);
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_periodic(rrc,
+                               &ue_context_p->ue_context,
+                               ref_scs,
+                               set_id,
+                               rsrc_id,
+                               beam,
+                               (int)period,
+                               offset,
+                               sym,
+                               dur) != 0) {
+    LOG_E(NR_RRC,
+          "NCR telnet periodic: build/send failed mod=%ld rnti=0x%lx set=%ld rsrc=%ld beam=%ld period=%ld offset=%ld sym=%ld dur=%ld refscs=%ld\n",
+          mod,
+          rnti_l,
+          set_id,
+          rsrc_id,
+          beam,
+          period,
+          offset,
+          sym,
+          dur,
+          ref_scs);
+    prnt("ERR: periodic NCR send failed\n");
+    return 0;
+  }
+
+  LOG_I(NR_RRC,
+        "NCR telnet periodic command success mod=%ld rnti=0x%lx set=%ld rsrc=%ld beam=%ld period=%ld offset=%ld sym=%ld dur=%ld refscs=%ld\n",
+        mod,
+        rnti_l,
+        set_id,
+        rsrc_id,
+        beam,
+        period,
+        offset,
+        sym,
+        dur,
+        ref_scs);
+  prnt("OK: periodic NCR sent to UE rnti=0x%lx\n", rnti_l);
+  return 0;
+}
+
+static int ncr_telnet_aperiodic_cmd(char *cmdbuff, int debug, telnet_printfunc_t prnt)
+{
+  (void)debug;
+  LOG_I(NR_RRC, "NCR telnet aperiodic handler entered, cmdbuff=%s\n", cmdbuff ? cmdbuff : "(null)");
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long ref_scs = ncr_telnet_get_long_or(cmdbuff, "refscs", NR_SubcarrierSpacing_kHz30);
+  long rnti_l = 0, rsrc_id = 0, slotoffset = 0, sym = 0, dur = 0, bfw = 0, fields = 0;
+
+  if (!cmdbuff ||
+      !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l) ||
+      !ncr_telnet_get_long(cmdbuff, "rsrc", &rsrc_id) ||
+      !ncr_telnet_get_long(cmdbuff, "slotoffset", &slotoffset) ||
+      !ncr_telnet_get_long(cmdbuff, "sym", &sym) ||
+      !ncr_telnet_get_long(cmdbuff, "dur", &dur) ||
+      !ncr_telnet_get_long(cmdbuff, "bfw", &bfw) ||
+      !ncr_telnet_get_long(cmdbuff, "fields", &fields)) {
+    prnt("usage: ncr aperiodic mod=<0> rnti=<0x1234> [refscs=1] rsrc=<id> slotoffset=<n> sym=<n> dur=<n> bfw=<1..6> fields=<1..32>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    LOG_E(NR_RRC, "NCR telnet aperiodic: UE not found rnti=0x%lx\n", rnti_l);
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_aperiodic(rrc,
+                                &ue_context_p->ue_context,
+                                ref_scs,
+                                rsrc_id,
+                                slotoffset,
+                                sym,
+                                dur,
+                                bfw,
+                                fields) != 0) {
+    prnt("ERR: aperiodic NCR send failed\n");
+    return 0;
+  }
+
+  prnt("OK: aperiodic NCR sent to UE rnti=0x%lx\n", rnti_l);
+  return 0;
+}
+
+static int ncr_telnet_sp_cmd(char *cmdbuff, int debug, telnet_printfunc_t prnt)
+{
+  (void)debug;
+  LOG_I(NR_RRC, "NCR telnet sp handler entered, cmdbuff=%s\n", cmdbuff ? cmdbuff : "(null)");
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long ref_scs = ncr_telnet_get_long_or(cmdbuff, "refscs", NR_SubcarrierSpacing_kHz30);
+  long rnti_l = 0, set_id = 0, rsrc_id = 0, beam = 0, period = 0, offset = 0, sym = 0, dur = 0;
+
+  if (!cmdbuff ||
+      !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l) ||
+      !ncr_telnet_get_long(cmdbuff, "set", &set_id) ||
+      !ncr_telnet_get_long(cmdbuff, "rsrc", &rsrc_id) ||
+      !ncr_telnet_get_long(cmdbuff, "beam", &beam) ||
+      !ncr_telnet_get_long(cmdbuff, "period", &period) ||
+      !ncr_telnet_get_long(cmdbuff, "offset", &offset) ||
+      !ncr_telnet_get_long(cmdbuff, "sym", &sym) ||
+      !ncr_telnet_get_long(cmdbuff, "dur", &dur)) {
+    prnt("usage: ncr sp mod=<0> rnti=<0x1234> [refscs=1] set=<id> rsrc=<id> beam=<idx> period=<1|2|4|5|8|10|16|20> offset=<n> sym=<n> dur=<n>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    LOG_E(NR_RRC, "NCR telnet sp: UE not found rnti=0x%lx\n", rnti_l);
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_semi_persistent(rrc,
+                                      &ue_context_p->ue_context,
+                                      ref_scs,
+                                      set_id,
+                                      rsrc_id,
+                                      beam,
+                                      (int)period,
+                                      offset,
+                                      sym,
+                                      dur) != 0) {
+    prnt("ERR: semi-persistent NCR send failed\n");
+    return 0;
+  }
+
+  prnt("OK: semi-persistent NCR sent to UE rnti=0x%lx\n", rnti_l);
+  return 0;
+}
+
+static telnetshell_vardef_t ncr_telnet_vardef[] = {
+  { "", 0, 0, NULL }
+};
+
+static telnetshell_cmddef_t ncr_telnet_cmdarray[] = {
+  {
+    "periodic",
+    "send periodic NCR cfg",
+    ncr_telnet_periodic_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "aperiodic",
+    "send aperiodic NCR cfg",
+    ncr_telnet_aperiodic_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "sp",
+    "send semi-persistent NCR cfg",
+    ncr_telnet_sp_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "",
+    "",
+    NULL,
+    {0},
+    0,
+    NULL
+  }
+};
+
+static int ncr_telnet_register_cmds(void)
+{
+  static bool registered = false;
+  if (registered)
+    return 0;
+
+  add_telnetcmd_func_t add_cmd =
+      NULL;
+  void *telnet_handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+  if (telnet_handle)
+    add_cmd = (add_telnetcmd_func_t)dlsym(telnet_handle, TELNET_ADDCMD_FNAME);
+  if (!add_cmd) {
+    void *lib_handle = dlopen("libtelnetsrv.so", RTLD_NOW | RTLD_GLOBAL);
+    if (lib_handle)
+      add_cmd = (add_telnetcmd_func_t)dlsym(lib_handle, TELNET_ADDCMD_FNAME);
+  }
+
+  if (!add_cmd) {
+    LOG_W(NR_RRC,
+          "NCR telnet register skipped: symbol '%s' not found (is --telnetsrv loaded?)\n",
+          TELNET_ADDCMD_FNAME);
+    return -1;
+  }
+
+  int rc = add_cmd("ncr", ncr_telnet_vardef, ncr_telnet_cmdarray);
+  if (rc != 0) {
+    LOG_E(NR_RRC, "NCR telnet command registration failed\n");
+    return -1;
+  }
+
+  registered = true;
+  LOG_I(NR_RRC, "NCR telnet commands registered\n");
+  return 0;
+}
+
 typedef struct ncr_delayed_cmd_args_s {
   int module_id;
   sctp_assoc_t assoc_id;
@@ -1084,6 +1592,7 @@ void openair_rrc_gNB_configuration(gNB_RRC_INST *rrc, gNB_RrcConfigurationReq *c
   RB_INIT(&rrc->cuups);
   RB_INIT(&rrc->dus);
   rrc->configuration = *configuration;
+  ncr_telnet_register_cmds();
 }
 
 static void rrc_gNB_process_AdditionRequestInformation(const module_id_t gnb_mod_idP, x2ap_ENDC_sgnb_addition_req_t *m)
