@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 import atexit
 import os
+import re
 import signal
 import subprocess
 
@@ -40,6 +41,24 @@ SCRIPT_COMMANDS = [
 
 started_processes = []
 oai_started = False
+
+
+# ============================================================
+# UE RNTI / ID 擷取設定
+# ============================================================
+
+UE_RNTI_PATTERNS = [
+    re.compile(r"\bUE\s+RNTI\s+([0-9a-fA-F]+)\b"),
+    re.compile(r"\bUE\s+([0-9a-fA-F]+)\s*:\s+"),
+]
+
+UE_RNTI_SCAN_FILES = [
+    LOG_DIR / "gnb_cmd.log",
+    LOG_DIR / "ue_cmd.log",
+    Path("/tmp/gnb.log"),
+]
+
+MAX_LOG_TAIL_BYTES = 1024 * 1024
 
 
 def start_oai_scripts_once():
@@ -144,6 +163,8 @@ state = {
             "role": "Network-Controlled Repeater",
             "status": "connected",
             "ip": "127.0.0.1",
+            "ue_id": None,
+            "ue_id_updated_at": None,
         },
     },
     "link": {
@@ -182,24 +203,113 @@ def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def read_log_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
+    """
+    只讀 log 尾端，避免 log 很大時拖慢網頁。
+    """
+
+    if not path.exists() or not path.is_file():
+        return ""
+
+    try:
+        with open(path, "rb") as file_obj:
+            file_obj.seek(0, os.SEEK_END)
+            file_size = file_obj.tell()
+            start_pos = max(0, file_size - max_bytes)
+            file_obj.seek(start_pos)
+            data = file_obj.read()
+        return data.decode("utf-8", errors="ignore")
+    except Exception as exc:
+        print(f"[WEB][UE-ID] Failed to read log {path}: {exc}")
+        return ""
+
+
+def extract_last_ue_rnti_from_text(text: str):
+    """
+    從 OAI log 裡抓 UE RNTI。
+
+    支援範例：
+    UE RNTI 371a CU-UE-ID 1 in-sync ...
+    UE 371a: dlsch_rounds ...
+    UE 371a: MAC: TX ...
+    """
+
+    matches = []
+
+    for pattern in UE_RNTI_PATTERNS:
+        for match in pattern.finditer(text):
+            value = match.group(1).lower()
+            matches.append((match.start(), value))
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda item: item[0])
+    return matches[-1][1]
+
+
+def refresh_ncr_ue_id_from_logs():
+    """
+    掃描 gNB/UE log，抓最後出現的 UE RNTI，更新到 NCR 狀態。
+    """
+
+    candidates = []
+
+    for path in UE_RNTI_SCAN_FILES:
+        text = read_log_tail(path)
+        if not text:
+            continue
+
+        ue_id = extract_last_ue_rnti_from_text(text)
+        if ue_id:
+            try:
+                mtime = path.stat().st_mtime
+            except Exception:
+                mtime = 0
+
+            candidates.append(
+                {
+                    "ue_id": ue_id,
+                    "path": str(path),
+                    "mtime": mtime,
+                }
+            )
+
+    if not candidates:
+        return state["nodes"]["ncr"].get("ue_id")
+
+    candidates.sort(key=lambda item: item["mtime"])
+    latest = candidates[-1]
+
+    old_ue_id = state["nodes"]["ncr"].get("ue_id")
+    new_ue_id = latest["ue_id"]
+
+    if old_ue_id != new_ue_id:
+        print(f"[WEB][UE-ID] NCR UE ID updated: {old_ue_id} -> {new_ue_id} from {latest['path']}")
+
+    state["nodes"]["ncr"]["ue_id"] = new_ue_id
+    state["nodes"]["ncr"]["ue_id_updated_at"] = now_text()
+    state["nodes"]["ncr"]["ue_id_source_log"] = latest["path"]
+
+    return new_ue_id
+
+
 def read_params_from_request(raw):
     """
     同時支援兩種前端格式：
 
-    格式 A：目前 app.js 用的格式
+    格式 A：
     {
         "type": "Periodic",
         "params": {
-            "resource_id": 0,
-            ...
+            "resource_id": 0
         }
     }
 
-    格式 B：扁平格式
+    格式 B：
     {
         "type": "Periodic",
-        "resource_id": 0,
-        ...
+        "resource_id": 0
     }
     """
 
@@ -309,20 +419,7 @@ def index():
 
 @app.route("/api/state", methods=["GET"])
 def get_state():
-    """
-    注意：
-    這裡直接回傳 state。
-    因為您目前的 app.js 是這樣讀：
-        state.nodes.gnb.status
-        state.messages
-        state.rules
-
-    所以不能包成：
-        {"ok": true, "state": state}
-
-    否則一進網頁就會載入狀態失敗。
-    """
-
+    refresh_ncr_ue_id_from_logs()
     return jsonify(state)
 
 
@@ -335,6 +432,8 @@ def send_message():
     3. NCR 接收後保存成 rule。
     4. 回傳更新後的 state 給前端刷新列表。
     """
+
+    refresh_ncr_ue_id_from_logs()
 
     raw = request.get_json(silent=True)
 
@@ -378,6 +477,8 @@ def send_message():
 
 @app.route("/api/messages", methods=["GET"])
 def get_messages():
+    refresh_ncr_ue_id_from_logs()
+
     return jsonify(
         {
             "ok": True,
@@ -388,6 +489,8 @@ def get_messages():
 
 @app.route("/api/rules", methods=["GET"])
 def get_rules():
+    refresh_ncr_ue_id_from_logs()
+
     return jsonify(
         {
             "ok": True,
@@ -398,10 +501,13 @@ def get_rules():
 
 @app.route("/api/runtime", methods=["GET"])
 def get_runtime_status():
+    refresh_ncr_ue_id_from_logs()
+
     return jsonify(
         {
             "ok": True,
             "oai_started": oai_started,
+            "ncr_ue_id": state["nodes"]["ncr"].get("ue_id"),
             "processes": get_runtime_process_status(),
         }
     )
