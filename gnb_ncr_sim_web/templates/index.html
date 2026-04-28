@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gNB × NCR Simulator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">NR Rel-18 NCR Lab</p>
+        <h1>gNB × NCR 模擬控制台</h1>
+      </div>
+      <div class="status-pill"><span></span> Connected</div>
+    </header>
+
+    <section class="canvas-card">
+      <div class="node node-gnb" id="gnbNode">
+        <div class="node-icon">g</div>
+        <div>
+          <h2>gNB</h2>
+          <p>Base Station</p>
+          <small id="gnbStatus">online</small>
+        </div>
+      </div>
+
+      <div class="link-line">
+        <div class="pulse-dot"></div>
+      </div>
+
+      <div class="node node-ncr" id="ncrNode">
+        <div class="node-icon">n</div>
+        <div>
+          <h2>NCR</h2>
+          <p>Network-Controlled Repeater</p>
+          <small id="ncrStatus">connected</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="actions-card">
+      <div class="section-heading">
+        <h2>發送 NCR Forwarding 訊息</h2>
+        <p>選擇訊息類型後填入數值，送出後會由 gNB 傳送到 NCR。</p>
+      </div>
+      <div class="button-row">
+        <button class="send-btn" data-type="Periodic">Periodic</button>
+        <button class="send-btn" data-type="Aperiodic">Aperiodic</button>
+        <button class="send-btn" data-type="Semi-persistent">Semi-persistent</button>
+      </div>
+    </section>
+
+    <section class="actions-card">
+      <div class="section-heading">
+        <h2>NCR Forwarding 規則列表</h2>
+        <p>記錄 NCR 已接收並保存的 Forwarding 規則。</p>
+      </div>
+      <div id="rulesList" class="rules-list empty">尚無規則</div>
+    </section>
+
+    <section class="log-card">
+      <div class="section-heading compact">
+        <h2>傳送紀錄</h2>
+        <button id="refreshBtn" class="ghost-btn">重新整理</button>
+      </div>
+      <div id="messageLog" class="message-log empty">尚未發送訊息</div>
+    </section>
+  </main>
+
+  <div id="modalBackdrop" class="modal-backdrop hidden">
+    <form id="sendForm" class="modal">
+      <div class="modal-header">
+        <div>
+          <p class="eyebrow">Message Setup</p>
+          <h2 id="modalTitle">發送訊息</h2>
+        </div>
+        <button type="button" id="closeModal" class="icon-btn">×</button>
+      </div>
+
+      <div class="form-grid">
+        <label>resource id<input name="resource_id" type="number" required value="0"></label>
+        <label>rsrc id<input name="rsrc_id" type="number" required value="0"></label>
+        <label>beam<input name="beam" type="number" required value="7"></label>
+        <label>slotPeriod<input name="slotPeriod" type="number" required value="20"></label>
+        <label>slotOffset<input name="slotOffset" type="number" required value="0"></label>
+        <label>symbol offset<input name="symbol_offset" type="number" required value="2"></label>
+        <label>duration in symbols<input name="duration_in_symbols" type="number" required value="4"></label>
+        <label>ref_scs<input name="ref_scs" type="number" required value="1"></label>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" id="cancelBtn" class="ghost-btn">取消</button>
+        <button type="submit" class="primary-btn">發送</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
