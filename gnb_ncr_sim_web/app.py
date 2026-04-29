@@ -30,7 +30,7 @@ TELNET_COMMAND_LOG = LOG_DIR / "telnet_commands.log"
 # ============================================================
 
 TELNET_HOST = "127.0.0.1"
-TELNET_PORT = 9090
+TELNET_PORT = 16888
 TELNET_TIMEOUT = 2
 
 
@@ -150,6 +150,25 @@ def append_telnet_log(text):
 # ============================================================
 # 啟動 / 關閉 OAI scripts
 # ============================================================
+
+def reset_oai_runtime_logs_on_start():
+    """
+    網站啟動時先刪掉 gNB / UE 的舊 log。
+    只刪 SCRIPT_COMMANDS 裡設定的 gnb_cmd.log 與 ue_cmd.log。
+    """
+
+    for item in SCRIPT_COMMANDS:
+        log_path = item["log"]
+
+        try:
+            if log_path.exists():
+                log_path.unlink()
+                print(f"[WEB][BOOT] Removed old {item['name']} log: {log_path}", flush=True)
+        except Exception as exc:
+            print(
+                f"[WEB][BOOT] Failed to remove old {item['name']} log {log_path}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
 def start_oai_scripts_once():
     """
@@ -682,6 +701,7 @@ def get_runtime_status():
 # ============================================================
 
 if __name__ == "__main__":
+    reset_oai_runtime_logs_on_start()
     start_oai_scripts_once()
 
     app.run(
