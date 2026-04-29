@@ -7,11 +7,10 @@ const refreshBtn = document.getElementById('refreshBtn');
 const messageLog = document.getElementById('messageLog');
 const rulesList = document.getElementById('rulesList');
 const toast = document.getElementById('toast');
-const ncrUeId = document.getElementById('ncrUeId');
 
 let currentType = 'Periodic';
 let toastTimer = null;
-let autoRefreshTimer = null;
+let latestState = null;
 
 function showToast(message) {
   toast.textContent = message;
@@ -24,9 +23,36 @@ function showToast(message) {
   }, 2200);
 }
 
+function getNextResourceId() {
+  if (latestState && Number.isInteger(Number(latestState.next_resource_id))) {
+    return Number(latestState.next_resource_id);
+  }
+
+  if (latestState && Array.isArray(latestState.rules)) {
+    return latestState.rules.length + 1;
+  }
+
+  return 1;
+}
+
+function setResourceIdInput() {
+  const input = sendForm.querySelector('input[name="resource_id"]');
+
+  if (!input) {
+    return;
+  }
+
+  input.value = getNextResourceId();
+  input.readOnly = true;
+  input.classList.add('readonly-input');
+}
+
 function openModal(type) {
   currentType = type;
   modalTitle.textContent = `發送 ${type} 訊息`;
+
+  setResourceIdInput();
+
   modalBackdrop.classList.remove('hidden');
 }
 
@@ -41,6 +67,8 @@ function collectParams(form) {
   for (const [key, value] of data.entries()) {
     params[key] = Number(value);
   }
+
+  params.resource_id = getNextResourceId();
 
   return params;
 }
@@ -70,14 +98,17 @@ function escapeHtml(value) {
 function updateNodeState(state) {
   const gnbStatus = document.getElementById('gnbStatus');
   const ncrStatus = document.getElementById('ncrStatus');
+  const ncrUeId = document.getElementById('ncrUeId');
 
-  if (state.nodes && state.nodes.gnb) {
+  if (state.nodes && state.nodes.gnb && gnbStatus) {
     gnbStatus.textContent = state.nodes.gnb.status || 'unknown';
   }
 
-  if (state.nodes && state.nodes.ncr) {
+  if (state.nodes && state.nodes.ncr && ncrStatus) {
     ncrStatus.textContent = state.nodes.ncr.status || 'unknown';
+  }
 
+  if (state.nodes && state.nodes.ncr && ncrUeId) {
     const ueId = state.nodes.ncr.ue_id;
 
     if (ueId) {
@@ -106,6 +137,7 @@ function renderRules(rules) {
           <tr>
             <th>Rule ID</th>
             <th>Type</th>
+            <th>Resource ID</th>
             <th>Rsrc</th>
             <th>Beam</th>
             <th>Period</th>
@@ -119,8 +151,9 @@ function renderRules(rules) {
         <tbody>
           ${rules.map((rule) => `
             <tr>
-              <td>#${escapeHtml(rule.id)}</td>
+              <td>#${escapeHtml(rule.params.resource_id)}</td>
               <td><span class="rule-type">${escapeHtml(rule.type)}</span></td>
+              <td>${escapeHtml(rule.params.resource_id)}</td>
               <td>${escapeHtml(rule.params.rsrc_id)}</td>
               <td>${escapeHtml(rule.params.beam)}</td>
               <td>${escapeHtml(rule.params.slotPeriod)}</td>
@@ -152,11 +185,22 @@ function renderMessages(messages) {
       <div class="log-detail">
         <strong>${escapeHtml(message.time)}</strong><br>
         ${escapeHtml(message.from)} → ${escapeHtml(message.to)}<br>
-        ${escapeHtml(paramsToText(message.params))}
+        ${escapeHtml(paramsToText(message.params))}<br>
+        <span class="telnet-command">TELNET: ${escapeHtml(message.telnet_command || '')}</span>
       </div>
       <div class="log-status">${escapeHtml(message.status)}</div>
     </div>
   `).join('');
+}
+
+function applyState(state) {
+  latestState = state;
+
+  updateNodeState(state);
+  renderMessages(state.messages || []);
+  renderRules(state.rules || []);
+
+  setResourceIdInput();
 }
 
 async function loadState() {
@@ -168,9 +212,7 @@ async function loadState() {
 
   const state = await response.json();
 
-  updateNodeState(state);
-  renderMessages(state.messages || []);
-  renderRules(state.rules || []);
+  applyState(state);
 }
 
 async function sendMessage(event) {
@@ -196,12 +238,10 @@ async function sendMessage(event) {
     return;
   }
 
-  updateNodeState(result.state);
-  renderMessages(result.state.messages || []);
-  renderRules(result.state.rules || []);
+  applyState(result.state);
 
   hideModal();
-  showToast(`${currentType} 已送達 NCR，規則已寫入列表`);
+  showToast(`${currentType} 已透過 telnet 送到 gNB`);
 }
 
 function refreshAll() {
@@ -229,7 +269,7 @@ modalBackdrop.addEventListener('click', (event) => {
 
 refreshAll();
 
-autoRefreshTimer = setInterval(() => {
+setInterval(() => {
   loadState().catch((error) => {
     console.error(error);
   });

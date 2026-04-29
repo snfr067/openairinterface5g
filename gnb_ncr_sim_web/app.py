@@ -6,7 +6,9 @@ import os
 import re
 import signal
 import subprocess
-
+import telnetlib
+import time
+import traceback
 
 app = Flask(__name__)
 
@@ -20,6 +22,16 @@ OAI_DIR = BASE_DIR.parent
 
 LOG_DIR = BASE_DIR / "runtime_logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+TELNET_COMMAND_LOG = LOG_DIR / "telnet_commands.log"
+
+
+# ============================================================
+# Telnet 設定
+# ============================================================
+
+TELNET_HOST = "127.0.0.1"
+TELNET_PORT = 9090
+TELNET_TIMEOUT = 2
 
 
 # ============================================================
@@ -60,6 +72,84 @@ UE_RNTI_SCAN_FILES = [
 
 MAX_LOG_TAIL_BYTES = 1024 * 1024
 
+
+# ============================================================
+# Demo 狀態資料
+# ============================================================
+
+state = {
+    "nodes": {
+        "gnb": {
+            "id": "gNB-001",
+            "name": "gNB",
+            "role": "Base Station",
+            "status": "online",
+            "ip": "127.0.0.1",
+        },
+        "ncr": {
+            "id": "NCR-001",
+            "name": "NCR",
+            "role": "Network-Controlled Repeater",
+            "status": "connected",
+            "ip": "127.0.0.1",
+            "ue_id": None,
+            "ue_id_updated_at": None,
+            "ue_id_source_log": None,
+        },
+    },
+    "link": {
+        "source": "gNB-001",
+        "target": "NCR-001",
+        "connected": True,
+    },
+    "messages": [],
+    "rules": [],
+}
+
+
+MESSAGE_TYPES = {
+    "Periodic",
+    "Aperiodic",
+    "Semi-persistent",
+}
+
+TELNET_TYPE_MAP = {
+    "Periodic": "periodic",
+    "Aperiodic": "aperiodic",
+    "Semi-persistent": "semi-persistent",
+}
+
+NUMERIC_FIELDS = [
+    "rsrc_id",
+    "beam",
+    "slotPeriod",
+    "slotOffset",
+    "symbol_offset",
+    "duration_in_symbols",
+    "ref_scs",
+]
+
+
+def append_telnet_log(text):
+    """
+    強制把 telnet 發送紀錄寫到網站自己的 log。
+    用來確認到底有沒有執行到發送流程。
+    """
+
+    line = f"[{now_text()}] {text}\n"
+
+    print(line, end="", flush=True)
+
+    try:
+        with open(TELNET_COMMAND_LOG, "a", encoding="utf-8") as log_file:
+            log_file.write(line)
+            log_file.flush()
+    except Exception as exc:
+        print(f"[WEB][TELNET][LOG-ERROR] {type(exc).__name__}: {exc}", flush=True)
+
+# ============================================================
+# 啟動 / 關閉 OAI scripts
+# ============================================================
 
 def start_oai_scripts_once():
     """
@@ -145,62 +235,18 @@ atexit.register(stop_oai_scripts)
 
 
 # ============================================================
-# Demo 狀態資料
-# ============================================================
-
-state = {
-    "nodes": {
-        "gnb": {
-            "id": "gNB-001",
-            "name": "gNB",
-            "role": "Base Station",
-            "status": "online",
-            "ip": "127.0.0.1",
-        },
-        "ncr": {
-            "id": "NCR-001",
-            "name": "NCR",
-            "role": "Network-Controlled Repeater",
-            "status": "connected",
-            "ip": "127.0.0.1",
-            "ue_id": None,
-            "ue_id_updated_at": None,
-        },
-    },
-    "link": {
-        "source": "gNB-001",
-        "target": "NCR-001",
-        "connected": True,
-    },
-    "messages": [],
-    "rules": [],
-}
-
-
-MESSAGE_TYPES = {
-    "Periodic",
-    "Aperiodic",
-    "Semi-persistent",
-}
-
-NUMERIC_FIELDS = [
-    "resource_id",
-    "rsrc_id",
-    "beam",
-    "slotPeriod",
-    "slotOffset",
-    "symbol_offset",
-    "duration_in_symbols",
-    "ref_scs",
-]
-
-
-# ============================================================
 # 工具函式
 # ============================================================
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def next_resource_id():
+    """
+    resource id 永遠由目前規則數 + 1 自動產生。
+    """
+    return len(state["rules"]) + 1
 
 
 def read_log_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
@@ -218,7 +264,9 @@ def read_log_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
             start_pos = max(0, file_size - max_bytes)
             file_obj.seek(start_pos)
             data = file_obj.read()
+
         return data.decode("utf-8", errors="ignore")
+
     except Exception as exc:
         print(f"[WEB][UE-ID] Failed to read log {path}: {exc}")
         return ""
@@ -261,19 +309,21 @@ def refresh_ncr_ue_id_from_logs():
             continue
 
         ue_id = extract_last_ue_rnti_from_text(text)
-        if ue_id:
-            try:
-                mtime = path.stat().st_mtime
-            except Exception:
-                mtime = 0
+        if not ue_id:
+            continue
 
-            candidates.append(
-                {
-                    "ue_id": ue_id,
-                    "path": str(path),
-                    "mtime": mtime,
-                }
-            )
+        try:
+            mtime = path.stat().st_mtime
+        except Exception:
+            mtime = 0
+
+        candidates.append(
+            {
+                "ue_id": ue_id,
+                "path": str(path),
+                "mtime": mtime,
+            }
+        )
 
     if not candidates:
         return state["nodes"]["ncr"].get("ue_id")
@@ -296,21 +346,26 @@ def refresh_ncr_ue_id_from_logs():
 
 def read_params_from_request(raw):
     """
-    同時支援兩種前端格式：
-
-    格式 A：
+    支援前端格式：
     {
         "type": "Periodic",
         "params": {
-            "resource_id": 0
+            "resource_id": 1,
+            "rsrc_id": 0,
+            ...
         }
     }
 
-    格式 B：
+    也支援扁平格式：
     {
         "type": "Periodic",
-        "resource_id": 0
+        "resource_id": 1,
+        "rsrc_id": 0,
+        ...
     }
+
+    注意：
+    resource_id 會由後端依目前規則數 + 1 自動覆蓋。
     """
 
     if not isinstance(raw, dict):
@@ -345,7 +400,9 @@ def normalize_payload(raw):
 
     params_source = read_params_from_request(raw)
 
-    params = {}
+    params = {
+        "resource_id": next_resource_id(),
+    }
 
     for field in NUMERIC_FIELDS:
         params[field] = parse_int_field(params_source, field)
@@ -353,16 +410,92 @@ def normalize_payload(raw):
     return message_type, params
 
 
+def build_telnet_command(message_type, params, ue_id):
+    """
+    建立實際送到 gNB telnet 的 NCR 指令。
+
+    範例：
+    ncr periodic mod=0 rnti=0x371a refscs=1 set=1 rsrc=0 beam=7 period=20 offset=0 sym=2 dur=4
+    """
+
+    telnet_type = TELNET_TYPE_MAP[message_type]
+
+    return (
+        f"ncr {telnet_type} "
+        f"mod=0 "
+        f"rnti=0x{ue_id} "
+        f"refscs={params['ref_scs']} "
+        f"set={params['resource_id']} "
+        f"rsrc={params['rsrc_id']} "
+        f"beam={params['beam']} "
+        f"period={params['slotPeriod']} "
+        f"offset={params['slotOffset']} "
+        f"sym={params['symbol_offset']} "
+        f"dur={params['duration_in_symbols']}"
+    )
+
+
+def send_telnet_command(command):
+    """
+    把指令送到 gNB telnet，並強制留下送出紀錄。
+    """
+
+    append_telnet_log(f"[SEND-BEGIN] host={TELNET_HOST} port={TELNET_PORT} command={command}")
+
+    chunks = []
+
+    try:
+        with telnetlib.Telnet(TELNET_HOST, TELNET_PORT, TELNET_TIMEOUT) as tn:
+            append_telnet_log("[CONNECTED] telnet connected")
+
+            try:
+                banner = tn.read_very_eager().decode(errors="ignore")
+            except EOFError:
+                banner = ""
+
+            if banner:
+                chunks.append("[banner]\n" + banner)
+                append_telnet_log(f"[BANNER] {banner.strip()}")
+
+            tn.write(command.encode("utf-8") + b"\n")
+            append_telnet_log(f"[WRITE-DONE] {command}")
+
+            for _ in range(8):
+                time.sleep(0.2)
+
+                try:
+                    data = tn.read_very_eager()
+                except EOFError:
+                    append_telnet_log("[READ-EOF]")
+                    break
+
+                if data:
+                    decoded = data.decode(errors="ignore")
+                    chunks.append(decoded)
+                    append_telnet_log(f"[READ] {decoded.strip()}")
+
+        result = "".join(chunks).strip() or "(沒有收到 telnet 回覆)"
+        append_telnet_log(f"[SEND-END] result={result}")
+
+        return result
+
+    except Exception as exc:
+        append_telnet_log(f"[SEND-ERROR] {type(exc).__name__}: {exc}")
+        append_telnet_log(traceback.format_exc())
+        raise
+
 def make_rule_from_message(message):
     params = message["params"]
 
     return {
-        "id": len(state["rules"]) + 1,
+        "id": params["resource_id"],
         "created_at": message["time"],
         "owner": state["nodes"]["ncr"]["id"],
         "source_message_id": message["id"],
         "type": message["type"],
         "status": "active",
+        "telnet_command": message["telnet_command"],
+        "telnet_result": message["telnet_result"],
         "params": params,
         "summary": (
             f"{message['type']} | "
@@ -420,20 +553,32 @@ def index():
 @app.route("/api/state", methods=["GET"])
 def get_state():
     refresh_ncr_ue_id_from_logs()
+
+    state["next_resource_id"] = next_resource_id()
+
     return jsonify(state)
 
 
 @app.route("/api/send", methods=["POST"])
 def send_message():
     """
-    Demo 流程：
+    流程：
     1. 前端送出 Periodic / Aperiodic / Semi-persistent。
-    2. gNB 建立 forwarding message。
-    3. NCR 接收後保存成 rule。
-    4. 回傳更新後的 state 給前端刷新列表。
+    2. 後端自動指定 resource_id = 目前規則數 + 1。
+    3. 從 log 抓 NCR UE ID，例如 371a。
+    4. 組 telnet 指令送到 127.0.0.1:9090。
+    5. telnet 成功後才新增 message 與 rule。
     """
 
-    refresh_ncr_ue_id_from_logs()
+    ue_id = refresh_ncr_ue_id_from_logs()
+
+    if not ue_id:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "尚未抓到 NCR 的 UE ID，請確認 gNB / UE log 已出現 UE RNTI。",
+            }
+        ), 400
 
     raw = request.get_json(silent=True)
 
@@ -447,6 +592,20 @@ def send_message():
             }
         ), 400
 
+    telnet_command = build_telnet_command(message_type, params, ue_id)
+    append_telnet_log(f"[API-SEND] prepared command={telnet_command}")
+
+    try:
+        telnet_result = send_telnet_command(telnet_command)
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"telnet send failed: {type(exc).__name__}: {exc}",
+                "telnet_command": telnet_command,
+            }
+        ), 502
+
     message = {
         "id": len(state["messages"]) + 1,
         "time": now_text(),
@@ -454,6 +613,9 @@ def send_message():
         "to": state["nodes"]["ncr"]["id"],
         "type": message_type,
         "params": params,
+        "rnti": f"0x{ue_id}",
+        "telnet_command": telnet_command,
+        "telnet_result": telnet_result,
         "status": "delivered",
     }
 
@@ -464,6 +626,7 @@ def send_message():
 
     state["messages"] = state["messages"][:80]
     state["rules"] = state["rules"][:80]
+    state["next_resource_id"] = next_resource_id()
 
     return jsonify(
         {
@@ -508,6 +671,7 @@ def get_runtime_status():
             "ok": True,
             "oai_started": oai_started,
             "ncr_ue_id": state["nodes"]["ncr"].get("ue_id"),
+            "next_resource_id": next_resource_id(),
             "processes": get_runtime_process_status(),
         }
     )
