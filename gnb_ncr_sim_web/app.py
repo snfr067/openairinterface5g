@@ -503,6 +503,35 @@ def send_telnet_command(command):
         append_telnet_log(traceback.format_exc())
         raise
 
+def telnet_result_is_success(result: str) -> bool:
+    """
+    判斷 telnet 指令是否可視為成功。
+
+    原則：
+    1. telnet exception 會在 send_message() 裡直接擋掉。
+    2. telnet 有回明顯錯誤字串時，不寫入 message/rule。
+    3. OAI telnet 有時候沒有回覆，因此「沒有收到 telnet 回覆」不直接當錯。
+    """
+
+    text = (result or "").lower()
+
+    error_keywords = [
+        "http/1.1 400",
+        "bad request",
+        "error",
+        "failed",
+        "failure",
+        "invalid",
+        "missing",
+        "unsupported",
+        "not found",
+        "cannot",
+        "unknown",
+    ]
+
+    return not any(keyword in text for keyword in error_keywords)
+
+
 def make_rule_from_message(message):
     params = message["params"]
 
@@ -584,9 +613,10 @@ def send_message():
     流程：
     1. 前端送出 Periodic / Aperiodic / Semi-persistent。
     2. 後端自動指定 resource_id = 目前規則數 + 1。
-    3. 從 log 抓 NCR UE ID，例如 371a。
+    3. 從 log 抓 NCR UE ID。
     4. 組 telnet 指令送到 127.0.0.1:9090。
-    5. telnet 成功後才新增 message 與 rule。
+    5. 只有 telnet 成功時才新增 message 與 rule。
+    6. telnet 失敗時直接回錯誤，不寫入規則列表；下一次 resource_id 仍維持同一個序號。
     """
 
     ue_id = refresh_ncr_ue_id_from_logs()
@@ -612,7 +642,6 @@ def send_message():
         ), 400
 
     telnet_command = build_telnet_command(message_type, params, ue_id)
-    append_telnet_log(f"[API-SEND] prepared command={telnet_command}")
 
     try:
         telnet_result = send_telnet_command(telnet_command)
@@ -620,10 +649,22 @@ def send_message():
         return jsonify(
             {
                 "ok": False,
-                "error": f"telnet send failed: {type(exc).__name__}: {exc}",
+                "error": f"telnet 發送失敗：{type(exc).__name__}: {exc}",
                 "telnet_command": telnet_command,
+                "state": state,
             }
         ), 502
+
+    if not telnet_result_is_success(telnet_result):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "telnet 指令被 gNB 拒絕，未寫入規則列表。",
+                "telnet_command": telnet_command,
+                "telnet_result": telnet_result,
+                "state": state,
+            }
+        ), 400
 
     message = {
         "id": len(state["messages"]) + 1,
@@ -655,7 +696,6 @@ def send_message():
             "state": state,
         }
     )
-
 
 @app.route("/api/messages", methods=["GET"])
 def get_messages():

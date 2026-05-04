@@ -137,7 +137,6 @@ function renderRules(rules) {
           <tr>
             <th>Rule ID</th>
             <th>Type</th>
-            <th>Resource ID</th>
             <th>Rsrc</th>
             <th>Beam</th>
             <th>Period</th>
@@ -153,7 +152,6 @@ function renderRules(rules) {
             <tr>
               <td>#${escapeHtml(rule.params.resource_id)}</td>
               <td><span class="rule-type">${escapeHtml(rule.type)}</span></td>
-              <td>${escapeHtml(rule.params.resource_id)}</td>
               <td>${escapeHtml(rule.params.rsrc_id)}</td>
               <td>${escapeHtml(rule.params.beam)}</td>
               <td>${escapeHtml(rule.params.slotPeriod)}</td>
@@ -169,7 +167,6 @@ function renderRules(rules) {
     </div>
   `;
 }
-
 function renderMessages(messages) {
   if (!messages.length) {
     messageLog.className = 'message-log empty';
@@ -223,25 +220,42 @@ async function sendMessage(event) {
     params: collectParams(sendForm),
   };
 
-  const response = await fetch('/api/send', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload),
-  });
+  let result = null;
 
-  const result = await response.json();
+  try {
+    const response = await fetch('/api/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload),
+    });
 
-  if (!response.ok || !result.ok) {
-    showToast(result.error || '發送失敗');
-    return;
+    result = await response.json();
+
+    if (!response.ok || !result.ok) {
+      const detail = result.telnet_result
+        ? `${result.error}\n${result.telnet_result}`
+        : (result.error || '發送失敗');
+
+      showToast(detail);
+
+      if (result.state) {
+        applyState(result.state);
+      }
+
+      return;
+    }
+
+    applyState(result.state);
+
+    hideModal();
+    showToast(`${currentType} 已透過 telnet 送到 gNB，規則已寫入列表`);
+
+  } catch (error) {
+    console.error(error);
+    showToast(`發送失敗：${error.message}`);
   }
-
-  applyState(result.state);
-
-  hideModal();
-  showToast(`${currentType} 已透過 telnet 送到 gNB`);
 }
 
 function refreshAll() {

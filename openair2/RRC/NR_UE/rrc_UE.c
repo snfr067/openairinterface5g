@@ -73,10 +73,538 @@
 #include "openair2/SDAP/nr_sdap/nr_sdap_entity.h"
 
 #include "openair2/RRC/NR/ncr/nr_ncr_ctx.h"
+#include <dlfcn.h>
+#include "common/utils/telnetsrv/telnetsrv.h"
+
+#include "common/utils/telnetsrv/telnetsrv.h"
+#include "common/utils/load_module_shlib.h"
+#include <pthread.h>
+#include <unistd.h>
 
 nr_ncr_ctx_t ncr_ctx;
 
 static NR_UE_RRC_INST_t *NR_UE_rrc_inst[MAX_NUM_NR_UE_INST] = {0};
+static int ue_ncr_telnet_get_forwarding_rule_all_cmd(char *cmdbuff, int debug, telnet_printfunc_t prnt)
+{
+  (void)cmdbuff;
+  (void)debug;
+
+  prnt("No Rule\n");
+  LOG_I(NR_RRC, "[NCR][UE][TELNET] getForwardingRule all -> No Rule\n");
+
+  return 0;
+}
+
+static telnetshell_vardef_t ue_ncr_telnet_vardef[] = {
+  { "", 0, 0, NULL }
+};
+
+static telnetshell_cmddef_t ue_ncr_get_forwarding_rule_cmdarray[] = {
+  {
+    "all",
+    "get all forwarding rules",
+    ue_ncr_telnet_get_forwarding_rule_all_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "",
+    "",
+    NULL,
+    {0},
+    0,
+    NULL
+  }
+};
+
+static int ue_ncr_telnet_register_cmds(void)
+{
+  static bool registered = false;
+  if (registered)
+    return 0;
+
+  add_telnetcmd_func_t add_cmd = NULL;
+
+  void *telnet_handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+  if (telnet_handle)
+    add_cmd = (add_telnetcmd_func_t)dlsym(telnet_handle, TELNET_ADDCMD_FNAME);
+
+  if (!add_cmd) {
+    void *lib_handle = dlopen("libtelnetsrv.so", RTLD_NOW | RTLD_GLOBAL);
+    if (lib_handle)
+      add_cmd = (add_telnetcmd_func_t)dlsym(lib_handle, TELNET_ADDCMD_FNAME);
+  }
+
+  if (!add_cmd) {
+    LOG_E(NR_RRC,
+          "[NCR][UE][TELNET] register failed: symbol '%s' not found\n",
+          TELNET_ADDCMD_FNAME);
+    return -1;
+  }
+
+  int rc = add_cmd("getForwardingRule", ue_ncr_telnet_vardef, ue_ncr_get_forwarding_rule_cmdarray);
+  if (rc != 0) {
+    LOG_E(NR_RRC, "[NCR][UE][TELNET] getForwardingRule command registration failed\n");
+    return -1;
+  }
+
+  registered = true;
+  LOG_I(NR_RRC, "[NCR][UE][TELNET] getForwardingRule command registered\n");
+
+  return 0;
+}
+
+
+#define NR_UE_NCR_MAX_FORWARDING_RULES 64
+
+typedef enum {
+  NR_UE_NCR_RULE_NONE = 0,
+  NR_UE_NCR_RULE_PERIODIC,
+  NR_UE_NCR_RULE_SEMI_PERSISTENT,
+  NR_UE_NCR_RULE_APERIODIC
+} nr_ue_ncr_rule_type_t;
+
+typedef struct {
+  bool valid;
+  nr_ue_ncr_rule_type_t type;
+
+  long set;
+  long rsrc;
+  long beam;
+
+  long period;
+  long offset;
+  long sym;
+  long dur;
+  long ref_scs;
+
+  long slot_offset;
+  long beam_field_width;
+  long number_of_fields;
+} nr_ue_ncr_forwarding_rule_t;
+
+static nr_ue_ncr_forwarding_rule_t nr_ue_ncr_forwarding_rules[NR_UE_NCR_MAX_FORWARDING_RULES];
+static pthread_mutex_t nr_ue_ncr_forwarding_rules_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t nr_ue_ncr_telnet_register_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool nr_ue_ncr_telnet_registered = false;
+static bool nr_ue_ncr_telnet_register_thread_started = false;
+
+/*
+ * add_telnetcmd() in this OAI branch rejects NULL var/cmd.
+ * This dummy variable table is mandatory even when this module exposes commands only.
+ */
+static telnetshell_vardef_t nr_ue_ncr_telnet_vardef[] = {
+  {"", 0, 0, NULL}
+};
+
+static const char *nr_ue_ncr_rule_type_to_string(nr_ue_ncr_rule_type_t type)
+{
+  switch (type) {
+    case NR_UE_NCR_RULE_PERIODIC:
+      return "periodic";
+    case NR_UE_NCR_RULE_SEMI_PERSISTENT:
+      return "semi_persistent";
+    case NR_UE_NCR_RULE_APERIODIC:
+      return "aperiodic";
+    default:
+      return "none";
+  }
+}
+
+static void nr_ue_ncr_store_periodic_forwarding_rule(long set,
+                                                     long rsrc,
+                                                     long beam,
+                                                     long period,
+                                                     long offset,
+                                                     long sym,
+                                                     long dur,
+                                                     long ref_scs)
+{
+  if (set < 0 || set >= NR_UE_NCR_MAX_FORWARDING_RULES) {
+    LOG_W(NR_RRC, "[NCR][UE] ignore periodic forwarding rule: invalid set=%ld\n", set);
+    return;
+  }
+
+  pthread_mutex_lock(&nr_ue_ncr_forwarding_rules_mutex);
+
+  nr_ue_ncr_forwarding_rule_t *rule = &nr_ue_ncr_forwarding_rules[set];
+  memset(rule, 0, sizeof(*rule));
+
+  rule->valid = true;
+  rule->type = NR_UE_NCR_RULE_PERIODIC;
+  rule->set = set;
+  rule->rsrc = rsrc;
+  rule->beam = beam;
+  rule->period = period;
+  rule->offset = offset;
+  rule->sym = sym;
+  rule->dur = dur;
+  rule->ref_scs = ref_scs;
+
+  pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
+}
+
+static void nr_ue_ncr_store_semipersistent_forwarding_rule(long set,
+                                                           long rsrc,
+                                                           long beam,
+                                                           long period,
+                                                           long offset,
+                                                           long sym,
+                                                           long dur,
+                                                           long ref_scs)
+{
+  if (set < 0 || set >= NR_UE_NCR_MAX_FORWARDING_RULES) {
+    LOG_W(NR_RRC, "[NCR][UE] ignore semi-persistent forwarding rule: invalid set=%ld\n", set);
+    return;
+  }
+
+  pthread_mutex_lock(&nr_ue_ncr_forwarding_rules_mutex);
+
+  nr_ue_ncr_forwarding_rule_t *rule = &nr_ue_ncr_forwarding_rules[set];
+  memset(rule, 0, sizeof(*rule));
+
+  rule->valid = true;
+  rule->type = NR_UE_NCR_RULE_SEMI_PERSISTENT;
+  rule->set = set;
+  rule->rsrc = rsrc;
+  rule->beam = beam;
+  rule->period = period;
+  rule->offset = offset;
+  rule->sym = sym;
+  rule->dur = dur;
+  rule->ref_scs = ref_scs;
+
+  pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
+}
+
+static void nr_ue_ncr_store_aperiodic_forwarding_rule(long set,
+                                                      long rsrc,
+                                                      long slot_offset,
+                                                      long sym,
+                                                      long dur,
+                                                      long ref_scs,
+                                                      long beam_field_width,
+                                                      long number_of_fields)
+{
+  if (set < 0 || set >= NR_UE_NCR_MAX_FORWARDING_RULES) {
+    LOG_W(NR_RRC, "[NCR][UE] ignore aperiodic forwarding rule: invalid set=%ld\n", set);
+    return;
+  }
+
+  pthread_mutex_lock(&nr_ue_ncr_forwarding_rules_mutex);
+
+  nr_ue_ncr_forwarding_rule_t *rule = &nr_ue_ncr_forwarding_rules[set];
+  memset(rule, 0, sizeof(*rule));
+
+  rule->valid = true;
+  rule->type = NR_UE_NCR_RULE_APERIODIC;
+  rule->set = set;
+  rule->rsrc = rsrc;
+  rule->slot_offset = slot_offset;
+  rule->sym = sym;
+  rule->dur = dur;
+  rule->ref_scs = ref_scs;
+  rule->beam_field_width = beam_field_width;
+  rule->number_of_fields = number_of_fields;
+
+  pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
+}
+
+static int nr_ue_ncr_count_forwarding_rules_locked(void)
+{
+  int count = 0;
+
+  for (int i = 0; i < NR_UE_NCR_MAX_FORWARDING_RULES; i++) {
+    if (nr_ue_ncr_forwarding_rules[i].valid)
+      count++;
+  }
+
+  return count;
+}
+
+static void nr_ue_ncr_telnet_print_one_rule(telnet_printfunc_t prnt,
+                                            const nr_ue_ncr_forwarding_rule_t *rule)
+{
+  if (!rule || !rule->valid)
+    return;
+
+  if (rule->type == NR_UE_NCR_RULE_APERIODIC) {
+    prnt("{\"type\":\"%s\",\"set\":%ld,\"rsrc\":%ld,\"slot_offset\":%ld,\"sym\":%ld,\"dur\":%ld,\"ref_scs\":%ld,\"beam_field_width\":%ld,\"number_of_fields\":%ld}\n",
+         nr_ue_ncr_rule_type_to_string(rule->type),
+         rule->set,
+         rule->rsrc,
+         rule->slot_offset,
+         rule->sym,
+         rule->dur,
+         rule->ref_scs,
+         rule->beam_field_width,
+         rule->number_of_fields);
+  } else {
+    prnt("{\"type\":\"%s\",\"set\":%ld,\"rsrc\":%ld,\"beam\":%ld,\"period\":%ld,\"offset\":%ld,\"sym\":%ld,\"dur\":%ld,\"ref_scs\":%ld}\n",
+         nr_ue_ncr_rule_type_to_string(rule->type),
+         rule->set,
+         rule->rsrc,
+         rule->beam,
+         rule->period,
+         rule->offset,
+         rule->sym,
+         rule->dur,
+         rule->ref_scs);
+  }
+}
+
+static int nr_ue_ncr_telnet_get_forwarding_rule_all(char *buff, int debug, telnet_printfunc_t prnt)
+{
+  (void)buff;
+  (void)debug;
+
+  pthread_mutex_lock(&nr_ue_ncr_forwarding_rules_mutex);
+
+  const int count = nr_ue_ncr_count_forwarding_rules_locked();
+  prnt("{\"ok\":true,\"count\":%d}\n", count);
+
+  for (int i = 0; i < NR_UE_NCR_MAX_FORWARDING_RULES; i++) {
+    if (nr_ue_ncr_forwarding_rules[i].valid)
+      nr_ue_ncr_telnet_print_one_rule(prnt, &nr_ue_ncr_forwarding_rules[i]);
+  }
+
+  pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
+  return 0;
+}
+
+static int nr_ue_ncr_telnet_get_forwarding_rule_by_set(long set, telnet_printfunc_t prnt)
+{
+  if (set < 0 || set >= NR_UE_NCR_MAX_FORWARDING_RULES) {
+    prnt("{\"ok\":false,\"error\":\"bad_set\",\"set\":%ld,\"count\":0}\n", set);
+    return 0;
+  }
+
+  pthread_mutex_lock(&nr_ue_ncr_forwarding_rules_mutex);
+
+  if (!nr_ue_ncr_forwarding_rules[set].valid) {
+    pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
+    prnt("{\"ok\":false,\"error\":\"not_found\",\"set\":%ld,\"count\":0}\n", set);
+    return 0;
+  }
+
+  prnt("{\"ok\":true,\"count\":1}\n");
+  nr_ue_ncr_telnet_print_one_rule(prnt, &nr_ue_ncr_forwarding_rules[set]);
+
+  pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
+  return 0;
+}
+
+#define NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(_set) \
+  static int nr_ue_ncr_telnet_get_forwarding_rule_set_##_set(char *buff, int debug, telnet_printfunc_t prnt) \
+  { \
+    (void)buff; \
+    (void)debug; \
+    return nr_ue_ncr_telnet_get_forwarding_rule_by_set((_set), prnt); \
+  }
+
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(0)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(1)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(2)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(3)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(4)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(5)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(6)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(7)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(8)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(9)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(10)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(11)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(12)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(13)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(14)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(15)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(16)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(17)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(18)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(19)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(20)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(21)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(22)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(23)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(24)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(25)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(26)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(27)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(28)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(29)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(30)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(31)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(32)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(33)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(34)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(35)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(36)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(37)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(38)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(39)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(40)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(41)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(42)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(43)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(44)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(45)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(46)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(47)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(48)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(49)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(50)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(51)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(52)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(53)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(54)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(55)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(56)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(57)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(58)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(59)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(60)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(61)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(62)
+NR_UE_NCR_DEFINE_GET_RULE_SET_CMD(63)
+
+static telnetshell_cmddef_t nr_ue_ncr_get_forwarding_rule_cmds[] = {
+  {"all", "show all stored NCR forwarding rules", nr_ue_ncr_telnet_get_forwarding_rule_all},
+  {"0", "show stored NCR forwarding rule set=0", nr_ue_ncr_telnet_get_forwarding_rule_set_0},
+  {"1", "show stored NCR forwarding rule set=1", nr_ue_ncr_telnet_get_forwarding_rule_set_1},
+  {"2", "show stored NCR forwarding rule set=2", nr_ue_ncr_telnet_get_forwarding_rule_set_2},
+  {"3", "show stored NCR forwarding rule set=3", nr_ue_ncr_telnet_get_forwarding_rule_set_3},
+  {"4", "show stored NCR forwarding rule set=4", nr_ue_ncr_telnet_get_forwarding_rule_set_4},
+  {"5", "show stored NCR forwarding rule set=5", nr_ue_ncr_telnet_get_forwarding_rule_set_5},
+  {"6", "show stored NCR forwarding rule set=6", nr_ue_ncr_telnet_get_forwarding_rule_set_6},
+  {"7", "show stored NCR forwarding rule set=7", nr_ue_ncr_telnet_get_forwarding_rule_set_7},
+  {"8", "show stored NCR forwarding rule set=8", nr_ue_ncr_telnet_get_forwarding_rule_set_8},
+  {"9", "show stored NCR forwarding rule set=9", nr_ue_ncr_telnet_get_forwarding_rule_set_9},
+  {"10", "show stored NCR forwarding rule set=10", nr_ue_ncr_telnet_get_forwarding_rule_set_10},
+  {"11", "show stored NCR forwarding rule set=11", nr_ue_ncr_telnet_get_forwarding_rule_set_11},
+  {"12", "show stored NCR forwarding rule set=12", nr_ue_ncr_telnet_get_forwarding_rule_set_12},
+  {"13", "show stored NCR forwarding rule set=13", nr_ue_ncr_telnet_get_forwarding_rule_set_13},
+  {"14", "show stored NCR forwarding rule set=14", nr_ue_ncr_telnet_get_forwarding_rule_set_14},
+  {"15", "show stored NCR forwarding rule set=15", nr_ue_ncr_telnet_get_forwarding_rule_set_15},
+  {"16", "show stored NCR forwarding rule set=16", nr_ue_ncr_telnet_get_forwarding_rule_set_16},
+  {"17", "show stored NCR forwarding rule set=17", nr_ue_ncr_telnet_get_forwarding_rule_set_17},
+  {"18", "show stored NCR forwarding rule set=18", nr_ue_ncr_telnet_get_forwarding_rule_set_18},
+  {"19", "show stored NCR forwarding rule set=19", nr_ue_ncr_telnet_get_forwarding_rule_set_19},
+  {"20", "show stored NCR forwarding rule set=20", nr_ue_ncr_telnet_get_forwarding_rule_set_20},
+  {"21", "show stored NCR forwarding rule set=21", nr_ue_ncr_telnet_get_forwarding_rule_set_21},
+  {"22", "show stored NCR forwarding rule set=22", nr_ue_ncr_telnet_get_forwarding_rule_set_22},
+  {"23", "show stored NCR forwarding rule set=23", nr_ue_ncr_telnet_get_forwarding_rule_set_23},
+  {"24", "show stored NCR forwarding rule set=24", nr_ue_ncr_telnet_get_forwarding_rule_set_24},
+  {"25", "show stored NCR forwarding rule set=25", nr_ue_ncr_telnet_get_forwarding_rule_set_25},
+  {"26", "show stored NCR forwarding rule set=26", nr_ue_ncr_telnet_get_forwarding_rule_set_26},
+  {"27", "show stored NCR forwarding rule set=27", nr_ue_ncr_telnet_get_forwarding_rule_set_27},
+  {"28", "show stored NCR forwarding rule set=28", nr_ue_ncr_telnet_get_forwarding_rule_set_28},
+  {"29", "show stored NCR forwarding rule set=29", nr_ue_ncr_telnet_get_forwarding_rule_set_29},
+  {"30", "show stored NCR forwarding rule set=30", nr_ue_ncr_telnet_get_forwarding_rule_set_30},
+  {"31", "show stored NCR forwarding rule set=31", nr_ue_ncr_telnet_get_forwarding_rule_set_31},
+  {"32", "show stored NCR forwarding rule set=32", nr_ue_ncr_telnet_get_forwarding_rule_set_32},
+  {"33", "show stored NCR forwarding rule set=33", nr_ue_ncr_telnet_get_forwarding_rule_set_33},
+  {"34", "show stored NCR forwarding rule set=34", nr_ue_ncr_telnet_get_forwarding_rule_set_34},
+  {"35", "show stored NCR forwarding rule set=35", nr_ue_ncr_telnet_get_forwarding_rule_set_35},
+  {"36", "show stored NCR forwarding rule set=36", nr_ue_ncr_telnet_get_forwarding_rule_set_36},
+  {"37", "show stored NCR forwarding rule set=37", nr_ue_ncr_telnet_get_forwarding_rule_set_37},
+  {"38", "show stored NCR forwarding rule set=38", nr_ue_ncr_telnet_get_forwarding_rule_set_38},
+  {"39", "show stored NCR forwarding rule set=39", nr_ue_ncr_telnet_get_forwarding_rule_set_39},
+  {"40", "show stored NCR forwarding rule set=40", nr_ue_ncr_telnet_get_forwarding_rule_set_40},
+  {"41", "show stored NCR forwarding rule set=41", nr_ue_ncr_telnet_get_forwarding_rule_set_41},
+  {"42", "show stored NCR forwarding rule set=42", nr_ue_ncr_telnet_get_forwarding_rule_set_42},
+  {"43", "show stored NCR forwarding rule set=43", nr_ue_ncr_telnet_get_forwarding_rule_set_43},
+  {"44", "show stored NCR forwarding rule set=44", nr_ue_ncr_telnet_get_forwarding_rule_set_44},
+  {"45", "show stored NCR forwarding rule set=45", nr_ue_ncr_telnet_get_forwarding_rule_set_45},
+  {"46", "show stored NCR forwarding rule set=46", nr_ue_ncr_telnet_get_forwarding_rule_set_46},
+  {"47", "show stored NCR forwarding rule set=47", nr_ue_ncr_telnet_get_forwarding_rule_set_47},
+  {"48", "show stored NCR forwarding rule set=48", nr_ue_ncr_telnet_get_forwarding_rule_set_48},
+  {"49", "show stored NCR forwarding rule set=49", nr_ue_ncr_telnet_get_forwarding_rule_set_49},
+  {"50", "show stored NCR forwarding rule set=50", nr_ue_ncr_telnet_get_forwarding_rule_set_50},
+  {"51", "show stored NCR forwarding rule set=51", nr_ue_ncr_telnet_get_forwarding_rule_set_51},
+  {"52", "show stored NCR forwarding rule set=52", nr_ue_ncr_telnet_get_forwarding_rule_set_52},
+  {"53", "show stored NCR forwarding rule set=53", nr_ue_ncr_telnet_get_forwarding_rule_set_53},
+  {"54", "show stored NCR forwarding rule set=54", nr_ue_ncr_telnet_get_forwarding_rule_set_54},
+  {"55", "show stored NCR forwarding rule set=55", nr_ue_ncr_telnet_get_forwarding_rule_set_55},
+  {"56", "show stored NCR forwarding rule set=56", nr_ue_ncr_telnet_get_forwarding_rule_set_56},
+  {"57", "show stored NCR forwarding rule set=57", nr_ue_ncr_telnet_get_forwarding_rule_set_57},
+  {"58", "show stored NCR forwarding rule set=58", nr_ue_ncr_telnet_get_forwarding_rule_set_58},
+  {"59", "show stored NCR forwarding rule set=59", nr_ue_ncr_telnet_get_forwarding_rule_set_59},
+  {"60", "show stored NCR forwarding rule set=60", nr_ue_ncr_telnet_get_forwarding_rule_set_60},
+  {"61", "show stored NCR forwarding rule set=61", nr_ue_ncr_telnet_get_forwarding_rule_set_61},
+  {"62", "show stored NCR forwarding rule set=62", nr_ue_ncr_telnet_get_forwarding_rule_set_62},
+  {"63", "show stored NCR forwarding rule set=63", nr_ue_ncr_telnet_get_forwarding_rule_set_63},
+  {"", "", NULL}
+};
+
+static bool nr_ue_ncr_try_register_get_forwarding_rule_telnet_cmd(void)
+{
+  pthread_mutex_lock(&nr_ue_ncr_telnet_register_mutex);
+
+  if (nr_ue_ncr_telnet_registered) {
+    pthread_mutex_unlock(&nr_ue_ncr_telnet_register_mutex);
+    return true;
+  }
+
+  add_telnetcmd_func_t addcmd =
+      (add_telnetcmd_func_t)get_shlibmodule_fptr("telnetsrv", TELNET_ADDCMD_FNAME);
+
+  if (addcmd == NULL) {
+    pthread_mutex_unlock(&nr_ue_ncr_telnet_register_mutex);
+    return false;
+  }
+
+  int rc = addcmd("getForwardingRule", nr_ue_ncr_telnet_vardef, nr_ue_ncr_get_forwarding_rule_cmds);
+  if (rc == 0) {
+    nr_ue_ncr_telnet_registered = true;
+    pthread_mutex_unlock(&nr_ue_ncr_telnet_register_mutex);
+    LOG_I(NR_RRC, "[NCR][UE] Telnet command registered: getForwardingRule all | <set>\n");
+    return true;
+  }
+
+  pthread_mutex_unlock(&nr_ue_ncr_telnet_register_mutex);
+  LOG_W(NR_RRC, "[NCR][UE] add_telnetcmd failed: getForwardingRule rc=%d\n", rc);
+  return false;
+}
+
+static void *nr_ue_ncr_telnet_register_thread(void *arg)
+{
+  (void)arg;
+
+  for (int i = 0; i < 200; i++) {
+    if (nr_ue_ncr_try_register_get_forwarding_rule_telnet_cmd())
+      return NULL;
+    usleep(100000);
+  }
+
+  LOG_W(NR_RRC, "[NCR][UE] Telnet command registration failed after retry: getForwardingRule\n");
+  return NULL;
+}
+
+static void nr_ue_ncr_start_telnet_register_thread(void)
+{
+  pthread_mutex_lock(&nr_ue_ncr_telnet_register_mutex);
+
+  if (nr_ue_ncr_telnet_registered || nr_ue_ncr_telnet_register_thread_started) {
+    pthread_mutex_unlock(&nr_ue_ncr_telnet_register_mutex);
+    return;
+  }
+
+  nr_ue_ncr_telnet_register_thread_started = true;
+  pthread_mutex_unlock(&nr_ue_ncr_telnet_register_mutex);
+
+  pthread_t tid;
+  int rc = pthread_create(&tid, NULL, nr_ue_ncr_telnet_register_thread, NULL);
+  if (rc == 0) {
+    pthread_detach(tid);
+  } else {
+    LOG_W(NR_RRC, "[NCR][UE] failed to create telnet register thread: rc=%d\n", rc);
+    pthread_mutex_lock(&nr_ue_ncr_telnet_register_mutex);
+    nr_ue_ncr_telnet_register_thread_started = false;
+    pthread_mutex_unlock(&nr_ue_ncr_telnet_register_mutex);
+  }
+}
+
 /* NAS Attach request with IMSI */
 static const char nr_nas_attach_req_imsi_dummy_NSA_case[] = {
     0x07,
@@ -1108,6 +1636,15 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
               slot_offset,
               rsrc->periodicTimeRsrc_r18.symbolOffset_r18,
               rsrc->periodicTimeRsrc_r18.durationInSymbols_r18);
+
+        nr_ue_ncr_store_periodic_forwarding_rule(set->periodicFwdRsrcSetId_r18,
+                                                 rsrc->periodicFwdRsrcId_r18,
+                                                 rsrc->beamIndex_r18,
+                                                 slot_period,
+                                                 slot_offset,
+                                                 rsrc->periodicTimeRsrc_r18.symbolOffset_r18,
+                                                 rsrc->periodicTimeRsrc_r18.durationInSymbols_r18,
+                                                 ref_scs);
       }
     }
   }
@@ -1141,18 +1678,29 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
           beam_field_width,
           number_of_fields);
 
-    for (int i = 0; i < ap->aperiodicFwdTimeRsrcToAddModList_r18->list.count; i++) {
-      NR_NCR_AperiodicFwdTimeResource_r18_t *rsrc =
-          ap->aperiodicFwdTimeRsrcToAddModList_r18->list.array[i];
-      if (!rsrc)
-        continue;
+    if (ap->aperiodicFwdTimeRsrcToAddModList_r18) {
+      for (int i = 0; i < ap->aperiodicFwdTimeRsrcToAddModList_r18->list.count; i++) {
+        NR_NCR_AperiodicFwdTimeResource_r18_t *rsrc =
+            ap->aperiodicFwdTimeRsrcToAddModList_r18->list.array[i];
+        if (!rsrc)
+          continue;
 
-      LOG_I(NR_RRC,
-            "[NCR][UE] AperiodicTimeRsrc: rsrcId=%ld slotOffsetAperiodic=%ld symbolOffset=%ld durationInSymbols=%ld\n",
-            rsrc->aperiodicFwdTimeRsrcId_r18,
-            rsrc->slotOffsetAperiodic_r18,
-            rsrc->symbolOffset_r18,
-            rsrc->durationInSymbols_r18);
+        LOG_I(NR_RRC,
+              "[NCR][UE] AperiodicTimeRsrc: rsrcId=%ld slotOffsetAperiodic=%ld symbolOffset=%ld durationInSymbols=%ld\n",
+              rsrc->aperiodicFwdTimeRsrcId_r18,
+              rsrc->slotOffsetAperiodic_r18,
+              rsrc->symbolOffset_r18,
+              rsrc->durationInSymbols_r18);
+
+        nr_ue_ncr_store_aperiodic_forwarding_rule(rsrc->aperiodicFwdTimeRsrcId_r18,
+                                                  rsrc->aperiodicFwdTimeRsrcId_r18,
+                                                  rsrc->slotOffsetAperiodic_r18,
+                                                  rsrc->symbolOffset_r18,
+                                                  rsrc->durationInSymbols_r18,
+                                                  ref_scs,
+                                                  beam_field_width,
+                                                  number_of_fields);
+      }
     }
   }
 
@@ -1200,6 +1748,15 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
               slot_offset,
               rsrc->semiPersistentTimeRsrc_r18.symbolOffset_r18,
               rsrc->semiPersistentTimeRsrc_r18.durationInSymbols_r18);
+
+        nr_ue_ncr_store_semipersistent_forwarding_rule(set->semiPersistentFwdRsrcSetId_r18,
+                                                       rsrc->semiPersistentFwdRsrcId_r18,
+                                                       rsrc->beamIndex_r18,
+                                                       slot_period,
+                                                       slot_offset,
+                                                       rsrc->semiPersistentTimeRsrc_r18.symbolOffset_r18,
+                                                       rsrc->semiPersistentTimeRsrc_r18.durationInSymbols_r18,
+                                                       ref_scs);
       }
     }
   }
@@ -1855,6 +2412,9 @@ NR_UE_RRC_INST_t* nr_rrc_init_ue(char* uecap_file, int instance_id, int num_ant_
   NR_UE_RRC_INST_t *rrc = NR_UE_rrc_inst[instance_id];
   rrc->ue_id = instance_id;
   memset(&rrc->ncr, 0, sizeof(rrc->ncr));
+  ue_ncr_telnet_register_cmds();
+  memset(nr_ue_ncr_forwarding_rules, 0, sizeof(nr_ue_ncr_forwarding_rules));
+  nr_ue_ncr_start_telnet_register_thread();
   //nr_ncr_ctx_init(&rrc->ncr);
   // nr_ncr_ctx_init(&rrc->ncr_ctx);
   // fill UE-NR-Capability @ UE-CapabilityRAT-Container here.
@@ -3301,6 +3861,7 @@ void *rrc_nrue(void *notUsed)
 
   NR_UE_RRC_INST_t *rrc = get_NR_UE_rrc_inst(instance);
   AssertFatal(instance == rrc->ue_id, "Instance %ld received from ITTI doesn't matach with UE-ID %ld\n", instance, rrc->ue_id);
+  nr_ue_ncr_try_register_get_forwarding_rule_telnet_cmd();
 
   switch (ITTI_MSG_ID(msg_p)) {
   case TERMINATE_MESSAGE:
