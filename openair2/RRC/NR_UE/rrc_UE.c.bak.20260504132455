@@ -73,6 +73,8 @@
 #include "openair2/SDAP/nr_sdap/nr_sdap_entity.h"
 
 #include "openair2/RRC/NR/ncr/nr_ncr_ctx.h"
+#include <dlfcn.h>
+#include "common/utils/telnetsrv/telnetsrv.h"
 
 #include "common/utils/telnetsrv/telnetsrv.h"
 #include "common/utils/load_module_shlib.h"
@@ -82,6 +84,77 @@
 nr_ncr_ctx_t ncr_ctx;
 
 static NR_UE_RRC_INST_t *NR_UE_rrc_inst[MAX_NUM_NR_UE_INST] = {0};
+static int ue_ncr_telnet_get_forwarding_rule_all_cmd(char *cmdbuff, int debug, telnet_printfunc_t prnt)
+{
+  (void)cmdbuff;
+  (void)debug;
+
+  prnt("No Rule\n");
+  LOG_I(NR_RRC, "[NCR][UE][TELNET] getForwardingRule all -> No Rule\n");
+
+  return 0;
+}
+
+static telnetshell_vardef_t ue_ncr_telnet_vardef[] = {
+  { "", 0, 0, NULL }
+};
+
+static telnetshell_cmddef_t ue_ncr_get_forwarding_rule_cmdarray[] = {
+  {
+    "all",
+    "get all forwarding rules",
+    ue_ncr_telnet_get_forwarding_rule_all_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "",
+    "",
+    NULL,
+    {0},
+    0,
+    NULL
+  }
+};
+
+static int ue_ncr_telnet_register_cmds(void)
+{
+  static bool registered = false;
+  if (registered)
+    return 0;
+
+  add_telnetcmd_func_t add_cmd = NULL;
+
+  void *telnet_handle = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+  if (telnet_handle)
+    add_cmd = (add_telnetcmd_func_t)dlsym(telnet_handle, TELNET_ADDCMD_FNAME);
+
+  if (!add_cmd) {
+    void *lib_handle = dlopen("libtelnetsrv.so", RTLD_NOW | RTLD_GLOBAL);
+    if (lib_handle)
+      add_cmd = (add_telnetcmd_func_t)dlsym(lib_handle, TELNET_ADDCMD_FNAME);
+  }
+
+  if (!add_cmd) {
+    LOG_E(NR_RRC,
+          "[NCR][UE][TELNET] register failed: symbol '%s' not found\n",
+          TELNET_ADDCMD_FNAME);
+    return -1;
+  }
+
+  int rc = add_cmd("getForwardingRule", ue_ncr_telnet_vardef, ue_ncr_get_forwarding_rule_cmdarray);
+  if (rc != 0) {
+    LOG_E(NR_RRC, "[NCR][UE][TELNET] getForwardingRule command registration failed\n");
+    return -1;
+  }
+
+  registered = true;
+  LOG_I(NR_RRC, "[NCR][UE][TELNET] getForwardingRule command registered\n");
+
+  return 0;
+}
+
 
 #define NR_UE_NCR_MAX_FORWARDING_RULES 64
 
@@ -2339,6 +2412,7 @@ NR_UE_RRC_INST_t* nr_rrc_init_ue(char* uecap_file, int instance_id, int num_ant_
   NR_UE_RRC_INST_t *rrc = NR_UE_rrc_inst[instance_id];
   rrc->ue_id = instance_id;
   memset(&rrc->ncr, 0, sizeof(rrc->ncr));
+  ue_ncr_telnet_register_cmds();
   memset(nr_ue_ncr_forwarding_rules, 0, sizeof(nr_ue_ncr_forwarding_rules));
   nr_ue_ncr_start_telnet_register_thread();
   //nr_ncr_ctx_init(&rrc->ncr);

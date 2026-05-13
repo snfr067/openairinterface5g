@@ -23,6 +23,70 @@ function showToast(message) {
   }, 2200);
 }
 
+function getSubmitButton() {
+  return sendForm.querySelector('button[type="submit"]');
+}
+
+function getModalStatusBox() {
+  let box = document.getElementById('modalStatusBox');
+
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'modalStatusBox';
+    box.className = 'modal-status hidden';
+
+    const footer = sendForm.querySelector('.modal-footer');
+    sendForm.insertBefore(box, footer);
+  }
+
+  return box;
+}
+
+function setSendingState(isSending, message = '') {
+  const submitBtn = getSubmitButton();
+  const statusBox = getModalStatusBox();
+  const formControls = sendForm.querySelectorAll('input, button');
+
+  formControls.forEach((control) => {
+    control.disabled = isSending;
+  });
+
+  if (closeModal) {
+    closeModal.disabled = isSending;
+  }
+
+  if (cancelBtn) {
+    cancelBtn.disabled = isSending;
+  }
+
+  if (submitBtn) {
+    if (isSending) {
+      submitBtn.dataset.originalText = submitBtn.textContent;
+      submitBtn.innerHTML = '<span class="btn-spinner"></span> 發送中';
+      submitBtn.classList.add('is-loading');
+    } else {
+      submitBtn.textContent = submitBtn.dataset.originalText || '發送';
+      submitBtn.classList.remove('is-loading');
+    }
+  }
+
+  if (isSending) {
+    statusBox.innerHTML = `
+      <div class="modal-status-spinner"></div>
+      <div>
+        <strong>正在透過 Telnet 發送指令</strong>
+        <p>${escapeHtml(message || '等待 gNB 回應中，請勿重複送出。')}</p>
+      </div>
+    `;
+    statusBox.classList.remove('hidden');
+    modalBackdrop.classList.add('is-busy');
+  } else {
+    statusBox.classList.add('hidden');
+    statusBox.innerHTML = '';
+    modalBackdrop.classList.remove('is-busy');
+  }
+}
+
 function getNextResourceId() {
   if (latestState && Number.isInteger(Number(latestState.next_resource_id))) {
     return Number(latestState.next_resource_id);
@@ -57,6 +121,10 @@ function openModal(type) {
 }
 
 function hideModal() {
+  if (modalBackdrop.classList.contains('is-busy')) {
+    return;
+  }
+
   modalBackdrop.classList.add('hidden');
 }
 
@@ -215,10 +283,19 @@ async function loadState() {
 async function sendMessage(event) {
   event.preventDefault();
 
+  if (modalBackdrop.classList.contains('is-busy')) {
+    return;
+  }
+
   const payload = {
     type: currentType,
     params: collectParams(sendForm),
   };
+
+  setSendingState(
+    true,
+    `準備送出 ${currentType} 指令，Rule ID #${payload.params.resource_id}`
+  );
 
   let result = null;
 
@@ -255,6 +332,9 @@ async function sendMessage(event) {
   } catch (error) {
     console.error(error);
     showToast(`發送失敗：${error.message}`);
+
+  } finally {
+    setSendingState(false);
   }
 }
 

@@ -555,3 +555,77 @@ input:focus {
     grid-template-columns: 1fr;
   }
 }
+.primary-btn.is-loading {
+  opacity: .92;
+  cursor: wait;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+}
+
+button:disabled,
+input:disabled {
+  cursor: wait;
+  opacity: .72;
+}
+
+.btn-spinner,
+.modal-status-spinner {
+  display: inline-block;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, .55);
+  border-top-color: #fff;
+  animation: spin .8s linear infinite;
+}
+
+.btn-spinner {
+  width: 16px;
+  height: 16px;
+}
+
+.modal-status {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 18px 0 4px;
+  padding: 14px 16px;
+  border: 1px solid #cfe0ff;
+  border-radius: 18px;
+  background: #f3f7ff;
+  color: var(--text);
+}
+
+.modal-status strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 15px;
+}
+
+.modal-status p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.modal-status-spinner {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-color: rgba(50, 104, 255, .22);
+  border-top-color: var(--accent);
+}
+
+.modal-backdrop.is-busy {
+  cursor: wait;
+}
+
+.modal-backdrop.is-busy .modal {
+  box-shadow: 0 30px 90px rgba(50, 104, 255, .28);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
