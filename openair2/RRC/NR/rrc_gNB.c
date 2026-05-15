@@ -443,6 +443,45 @@ static int ncr_encode_modified_mcg(NR_CellGroupConfig_t *cg,
   return 0;
 }
 
+static int ncr_build_ncr_fwd_release_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                       byte_array_t *dst_mcg)
+{
+  if (!src_mcg || !src_mcg->buf || src_mcg->len <= 0 || !dst_mcg)
+    return -1;
+
+  NR_CellGroupConfig_t *cg = NULL;
+  asn_dec_rval_t dec = uper_decode_complete(NULL,
+                                            &asn_DEF_NR_CellGroupConfig,
+                                            (void **)&cg,
+                                            src_mcg->buf,
+                                            src_mcg->len);
+  if (dec.code != RC_OK || dec.consumed == 0 || !cg) {
+    LOG_E(NR_RRC, "NCR release-all: failed to decode UE->mcg CellGroupConfig\n");
+    return -1;
+  }
+
+  if (!cg->ext6)
+    cg->ext6 = CALLOC(1, sizeof(*cg->ext6));
+
+  if (!cg->ext6->ncr_FwdConfig_r18)
+    cg->ext6->ncr_FwdConfig_r18 =
+        CALLOC(1, sizeof(*cg->ext6->ncr_FwdConfig_r18));
+
+  /*
+   * 關鍵：
+   * CellGroupConfig.ext6.ncr-FwdConfig-r18 是 SetupRelease 風格的 CHOICE。
+   * 設成 release 後，UE 端會進入
+   * NR_CellGroupConfig__ext6__ncr_FwdConfig_r18_PR_release 分支。
+   */
+  cg->ext6->ncr_FwdConfig_r18->present =
+      NR_CellGroupConfig__ext6__ncr_FwdConfig_r18_PR_release;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "release-all");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
+
+
 static int ncr_build_periodic_cgconfig_from_mcg(const byte_array_t *src_mcg,
                                                 byte_array_t *dst_mcg,
                                                 long ref_scs,
@@ -1112,6 +1151,50 @@ static int ncr_telnet_send_semi_persistent(gNB_RRC_INST *rrc,
   return 0;
 }
 
+static int ncr_telnet_send_all_release(gNB_RRC_INST *rrc,
+                                       gNB_RRC_UE_t *UE)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params =
+      get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_ncr_fwd_release_cgconfig_from_mcg(&UE->mcg,
+                                                  &modified_mcg) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(
+      rrc,
+      UE,
+      DL_SCH_LCID_DCCH,
+      NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+      msg.buf,
+      msg.len);
+
+  LOG_I(NR_RRC,
+        "NCR telnet release-all sent: UE rnti=%04x\n",
+        UE->rnti);
+
+  free_byte_array(msg);
+  return 0;
+}
+
 static int ncr_telnet_periodic_cmd(char *cmdbuff, int debug, telnet_printfunc_t prnt)
 {
   (void)debug;
@@ -1299,6 +1382,56 @@ static telnetshell_vardef_t ncr_telnet_vardef[] = {
   { "", 0, 0, NULL }
 };
 
+static int ncr_telnet_release_all_cmd(char *cmdbuff,
+                                      int debug,
+                                      telnet_printfunc_t prnt)
+{
+  (void)debug;
+
+  LOG_I(NR_RRC,
+        "NCR telnet release-all handler entered, cmdbuff=%s\n",
+        cmdbuff ? cmdbuff : "(null)");
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long rnti_l = 0;
+
+  if (!cmdbuff ||
+      !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l)) {
+    prnt("usage: ncr release_all mod=<0> rnti=<0x1234>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p =
+      ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+
+  if (!ue_context_p) {
+    LOG_E(NR_RRC,
+          "NCR telnet release-all: UE not found rnti=0x%lx\n",
+          rnti_l);
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_all_release(rrc,
+                                  &ue_context_p->ue_context) != 0) {
+    LOG_E(NR_RRC,
+          "NCR telnet release-all: build/send failed mod=%ld rnti=0x%lx\n",
+          mod,
+          rnti_l);
+    prnt("ERR: NCR release-all send failed\n");
+    return 0;
+  }
+
+  prnt("OK: NCR release-all sent to UE rnti=0x%lx\n", rnti_l);
+  return 0;
+}
+
 static telnetshell_cmddef_t ncr_telnet_cmdarray[] = {
   {
     "periodic",
@@ -1320,6 +1453,14 @@ static telnetshell_cmddef_t ncr_telnet_cmdarray[] = {
     "sp",
     "send semi-persistent NCR cfg",
     ncr_telnet_sp_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "release_all",
+    "release all NCR forwarding config",
+    ncr_telnet_release_all_cmd,
     {0},
     0,
     NULL

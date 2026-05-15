@@ -238,6 +238,17 @@ static void nr_ue_ncr_store_aperiodic_forwarding_rule(long set,
   pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
 }
 
+static void nr_ue_ncr_clear_all_forwarding_rules(void)
+{
+  pthread_mutex_lock(&nr_ue_ncr_forwarding_rules_mutex);
+
+  memset(nr_ue_ncr_forwarding_rules,
+         0,
+         sizeof(nr_ue_ncr_forwarding_rules));
+
+  pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
+}
+
 static int nr_ue_ncr_count_forwarding_rules_locked(void)
 {
   int count = 0;
@@ -1509,6 +1520,11 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
 
   if (ncr_ie->present == NR_CellGroupConfig__ext6__ncr_FwdConfig_r18_PR_release) {
     LOG_I(NR_RRC, "[NCR][UE] ncr_FwdConfig_r18 RELEASE\n");
+
+    nr_ue_ncr_clear_all_forwarding_rules();
+
+    LOG_I(NR_RRC,
+          "[NCR][UE] all stored NCR forwarding rules cleared\n");
     return;
   }
 
