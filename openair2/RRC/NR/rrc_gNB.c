@@ -443,6 +443,23 @@ static int ncr_encode_modified_mcg(NR_CellGroupConfig_t *cg,
   return 0;
 }
 
+static void ncr_clear_fwd_delta_fields(NR_NCR_FwdConfig_r18_t *fwd)
+{
+  if (!fwd)
+    return;
+
+  /*
+   * The telnet path sends one NCR delta per RRCReconfiguration.
+   * Drop any decoded stale delta pointers so a release command does not
+   * accidentally re-emit unrelated add/modify entries from UE->mcg.
+   */
+  fwd->periodicFwdRsrcSetToAddModList_r18 = NULL;
+  fwd->periodicFwdRsrcSetToReleaseList_r18 = NULL;
+  fwd->aperiodicFwdConfig_r18 = NULL;
+  fwd->semiPersistentFwdRsrcSetToAddModList_r18 = NULL;
+  fwd->semiPersistentFwdRsrcSetToReleaseList_r18 = NULL;
+}
+
 static int ncr_build_ncr_fwd_release_cgconfig_from_mcg(const byte_array_t *src_mcg,
                                                        byte_array_t *dst_mcg)
 {
@@ -481,6 +498,174 @@ static int ncr_build_ncr_fwd_release_cgconfig_from_mcg(const byte_array_t *src_m
   return rc;
 }
 
+
+static int ncr_build_periodic_set_release_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                            byte_array_t *dst_mcg,
+                                                            long set_id)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  NR_NCR_FwdConfig_r18_t *fwd = NULL;
+
+  if (ncr_decode_mcg_and_prepare_fwd(src_mcg, &cg, &fwd) != 0)
+    return -1;
+
+  ncr_clear_fwd_delta_fields(fwd);
+
+  fwd->periodicFwdRsrcSetToReleaseList_r18 =
+      CALLOC(1, sizeof(*fwd->periodicFwdRsrcSetToReleaseList_r18));
+
+  asn1cSequenceAdd(fwd->periodicFwdRsrcSetToReleaseList_r18->list,
+                   NR_NCR_PeriodicFwdResourceSetId_r18_t,
+                   rel_set_id);
+  *rel_set_id = set_id;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "periodic-set-release");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
+
+static int ncr_build_periodic_resource_release_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                                 byte_array_t *dst_mcg,
+                                                                 long set_id,
+                                                                 long rsrc_id)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  NR_NCR_FwdConfig_r18_t *fwd = NULL;
+
+  if (ncr_decode_mcg_and_prepare_fwd(src_mcg, &cg, &fwd) != 0)
+    return -1;
+
+  ncr_clear_fwd_delta_fields(fwd);
+
+  fwd->periodicFwdRsrcSetToAddModList_r18 =
+      CALLOC(1, sizeof(*fwd->periodicFwdRsrcSetToAddModList_r18));
+
+  asn1cSequenceAdd(fwd->periodicFwdRsrcSetToAddModList_r18->list,
+                   NR_NCR_PeriodicFwdResourceSet_r18_t,
+                   set);
+  set->periodicFwdRsrcSetId_r18 = set_id;
+  set->periodicFwdRsrcToReleaseList_r18 =
+      CALLOC(1, sizeof(*set->periodicFwdRsrcToReleaseList_r18));
+
+  asn1cSequenceAdd(set->periodicFwdRsrcToReleaseList_r18->list,
+                   NR_NCR_PeriodicFwdResourceId_r18_t,
+                   rel_rsrc_id);
+  *rel_rsrc_id = rsrc_id;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "periodic-resource-release");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
+
+static int ncr_build_aperiodic_release_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                         byte_array_t *dst_mcg)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  NR_NCR_FwdConfig_r18_t *fwd = NULL;
+
+  if (ncr_decode_mcg_and_prepare_fwd(src_mcg, &cg, &fwd) != 0)
+    return -1;
+
+  ncr_clear_fwd_delta_fields(fwd);
+
+  fwd->aperiodicFwdConfig_r18 = CALLOC(1, sizeof(*fwd->aperiodicFwdConfig_r18));
+  fwd->aperiodicFwdConfig_r18->present =
+      NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_release;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "aperiodic-release");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
+
+static int ncr_build_aperiodic_resource_release_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                                  byte_array_t *dst_mcg,
+                                                                  long rsrc_id)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  NR_NCR_FwdConfig_r18_t *fwd = NULL;
+
+  if (ncr_decode_mcg_and_prepare_fwd(src_mcg, &cg, &fwd) != 0)
+    return -1;
+
+  ncr_clear_fwd_delta_fields(fwd);
+
+  fwd->aperiodicFwdConfig_r18 = CALLOC(1, sizeof(*fwd->aperiodicFwdConfig_r18));
+  fwd->aperiodicFwdConfig_r18->present =
+      NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_setup;
+  fwd->aperiodicFwdConfig_r18->choice.setup =
+      CALLOC(1, sizeof(*fwd->aperiodicFwdConfig_r18->choice.setup));
+
+  NR_NCR_AperiodicFwdConfig_r18_t *ap = fwd->aperiodicFwdConfig_r18->choice.setup;
+  ap->aperiodicFwdTimeRsrcToReleaseList_r18 =
+      CALLOC(1, sizeof(*ap->aperiodicFwdTimeRsrcToReleaseList_r18));
+
+  asn1cSequenceAdd(ap->aperiodicFwdTimeRsrcToReleaseList_r18->list,
+                   NR_NCR_AperiodicFwdTimeResourceId_r18_t,
+                   rel_rsrc_id);
+  *rel_rsrc_id = rsrc_id;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "aperiodic-resource-release");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
+
+static int ncr_build_semi_persistent_set_release_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                                   byte_array_t *dst_mcg,
+                                                                   long set_id)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  NR_NCR_FwdConfig_r18_t *fwd = NULL;
+
+  if (ncr_decode_mcg_and_prepare_fwd(src_mcg, &cg, &fwd) != 0)
+    return -1;
+
+  ncr_clear_fwd_delta_fields(fwd);
+
+  fwd->semiPersistentFwdRsrcSetToReleaseList_r18 =
+      CALLOC(1, sizeof(*fwd->semiPersistentFwdRsrcSetToReleaseList_r18));
+
+  asn1cSequenceAdd(fwd->semiPersistentFwdRsrcSetToReleaseList_r18->list,
+                   NR_NCR_SemiPersistentFwdResourceSetId_r18_t,
+                   rel_set_id);
+  *rel_set_id = set_id;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "semi-persistent-set-release");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
+
+static int ncr_build_semi_persistent_resource_release_cgconfig_from_mcg(const byte_array_t *src_mcg,
+                                                                        byte_array_t *dst_mcg,
+                                                                        long set_id,
+                                                                        long rsrc_id)
+{
+  NR_CellGroupConfig_t *cg = NULL;
+  NR_NCR_FwdConfig_r18_t *fwd = NULL;
+
+  if (ncr_decode_mcg_and_prepare_fwd(src_mcg, &cg, &fwd) != 0)
+    return -1;
+
+  ncr_clear_fwd_delta_fields(fwd);
+
+  fwd->semiPersistentFwdRsrcSetToAddModList_r18 =
+      CALLOC(1, sizeof(*fwd->semiPersistentFwdRsrcSetToAddModList_r18));
+
+  asn1cSequenceAdd(fwd->semiPersistentFwdRsrcSetToAddModList_r18->list,
+                   NR_NCR_SemiPersistentFwdResourceSet_r18_t,
+                   set);
+  set->semiPersistentFwdRsrcSetId_r18 = set_id;
+  set->semiPersistentFwdRsrcToReleaseList_r18 =
+      CALLOC(1, sizeof(*set->semiPersistentFwdRsrcToReleaseList_r18));
+
+  asn1cSequenceAdd(set->semiPersistentFwdRsrcToReleaseList_r18->list,
+                   NR_NCR_SemiPersistentFwdResourceId_r18_t,
+                   rel_rsrc_id);
+  *rel_rsrc_id = rsrc_id;
+
+  int rc = ncr_encode_modified_mcg(cg, dst_mcg, "semi-persistent-resource-release");
+  ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cg);
+  return rc;
+}
 
 static int ncr_build_periodic_cgconfig_from_mcg(const byte_array_t *src_mcg,
                                                 byte_array_t *dst_mcg,
@@ -1195,6 +1380,260 @@ static int ncr_telnet_send_all_release(gNB_RRC_INST *rrc,
   return 0;
 }
 
+static int ncr_telnet_send_periodic_set_release(gNB_RRC_INST *rrc,
+                                                    gNB_RRC_UE_t *UE,
+                                                    long set_id)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_periodic_set_release_cgconfig_from_mcg(&UE->mcg,
+                                                       &modified_mcg,
+                                                       set_id) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC, "NCR telnet periodic-set release sent: setId=%ld\n", set_id);
+  free_byte_array(msg);
+  return 0;
+}
+
+static int ncr_telnet_send_periodic_resource_release(gNB_RRC_INST *rrc,
+                                                         gNB_RRC_UE_t *UE,
+                                                         long set_id,
+                                                         long rsrc_id)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_periodic_resource_release_cgconfig_from_mcg(&UE->mcg,
+                                                            &modified_mcg,
+                                                            set_id,
+                                                            rsrc_id) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC,
+        "NCR telnet periodic-resource release sent: setId=%ld rsrcId=%ld\n",
+        set_id,
+        rsrc_id);
+  free_byte_array(msg);
+  return 0;
+}
+
+static int ncr_telnet_send_aperiodic_release(gNB_RRC_INST *rrc,
+                                             gNB_RRC_UE_t *UE)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_aperiodic_release_cgconfig_from_mcg(&UE->mcg,
+                                                    &modified_mcg) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC, "NCR telnet aperiodic release sent\n");
+  free_byte_array(msg);
+  return 0;
+}
+
+static int ncr_telnet_send_aperiodic_resource_release(gNB_RRC_INST *rrc,
+                                                      gNB_RRC_UE_t *UE,
+                                                      long rsrc_id)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_aperiodic_resource_release_cgconfig_from_mcg(&UE->mcg,
+                                                             &modified_mcg,
+                                                             rsrc_id) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC, "NCR telnet aperiodic-resource release sent: rsrcId=%ld\n", rsrc_id);
+  free_byte_array(msg);
+  return 0;
+}
+
+static int ncr_telnet_send_semi_persistent_set_release(gNB_RRC_INST *rrc,
+                                                       gNB_RRC_UE_t *UE,
+                                                       long set_id)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_semi_persistent_set_release_cgconfig_from_mcg(&UE->mcg,
+                                                              &modified_mcg,
+                                                              set_id) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC, "NCR telnet semi-persistent-set release sent: setId=%ld\n", set_id);
+  free_byte_array(msg);
+  return 0;
+}
+
+static int ncr_telnet_send_semi_persistent_resource_release(gNB_RRC_INST *rrc,
+                                                            gNB_RRC_UE_t *UE,
+                                                            long set_id,
+                                                            long rsrc_id)
+{
+  if (!rrc || !UE)
+    return -1;
+
+  nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, UE, 0, false);
+  UE->xids[params.transaction_id] = RRC_DEDICATED_RECONF;
+
+  byte_array_t modified_mcg = {0};
+  byte_array_t msg = {0};
+
+  if (ncr_build_semi_persistent_resource_release_cgconfig_from_mcg(&UE->mcg,
+                                                                   &modified_mcg,
+                                                                   set_id,
+                                                                   rsrc_id) != 0) {
+    free_RRCReconfiguration_params(params);
+    return -1;
+  }
+
+  params.cgc = &modified_mcg;
+  msg = rrc_gNB_encode_RRCReconfiguration(rrc, UE, params);
+
+  free_RRCReconfiguration_params(params);
+  free_byte_array(modified_mcg);
+
+  if (!msg.buf || msg.len <= 0)
+    return -1;
+
+  nr_rrc_transfer_protected_rrc_message(rrc,
+                                        UE,
+                                        DL_SCH_LCID_DCCH,
+                                        NR_DL_DCCH_MessageType__c1_PR_rrcReconfiguration,
+                                        msg.buf,
+                                        msg.len);
+
+  LOG_I(NR_RRC,
+        "NCR telnet semi-persistent-resource release sent: setId=%ld rsrcId=%ld\n",
+        set_id,
+        rsrc_id);
+  free_byte_array(msg);
+  return 0;
+}
+
 static int ncr_telnet_periodic_cmd(char *cmdbuff, int debug, telnet_printfunc_t prnt)
 {
   (void)debug;
@@ -1378,6 +1817,255 @@ static int ncr_telnet_sp_cmd(char *cmdbuff, int debug, telnet_printfunc_t prnt)
   return 0;
 }
 
+static int ncr_telnet_rel_periodic_set_cmd(char *cmdbuff,
+                                                   int debug,
+                                                   telnet_printfunc_t prnt)
+{
+  (void)debug;
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long rnti_l = 0;
+  long set_id = 0;
+
+  if (!cmdbuff ||
+      !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l) ||
+      !ncr_telnet_get_long(cmdbuff, "set", &set_id)) {
+    prnt("usage: ncr rel_periodic_set mod=<0> rnti=<0x1234> set=<id>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_periodic_set_release(rrc,
+                                           &ue_context_p->ue_context,
+                                           set_id) != 0) {
+    prnt("ERR: periodic set release send failed\n");
+    return 0;
+  }
+
+  prnt("OK: periodic set release sent to UE rnti=0x%lx set=%ld\n", rnti_l, set_id);
+  return 0;
+}
+
+static int ncr_telnet_rel_periodic_rsrc_cmd(char *cmdbuff,
+                                                int debug,
+                                                telnet_printfunc_t prnt)
+{
+  (void)debug;
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long rnti_l = 0;
+  long set_id = 0;
+  long rsrc_id = 0;
+
+  if (!cmdbuff ||
+      !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l) ||
+      !ncr_telnet_get_long(cmdbuff, "set", &set_id) ||
+      !ncr_telnet_get_long(cmdbuff, "rsrc", &rsrc_id)) {
+    prnt("usage: ncr rel_periodic_rsrc mod=<0> rnti=<0x1234> set=<id> rsrc=<id>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_periodic_resource_release(rrc,
+                                                &ue_context_p->ue_context,
+                                                set_id,
+                                                rsrc_id) != 0) {
+    prnt("ERR: periodic resource release send failed\n");
+    return 0;
+  }
+
+  prnt("OK: periodic resource release sent to UE rnti=0x%lx set=%ld rsrc=%ld\n",
+       rnti_l,
+       set_id,
+       rsrc_id);
+  return 0;
+}
+
+static int ncr_telnet_release_aperiodic_cmd(char *cmdbuff,
+                                            int debug,
+                                            telnet_printfunc_t prnt)
+{
+  (void)debug;
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long rnti_l = 0;
+
+  if (!cmdbuff || !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l)) {
+    prnt("usage: ncr release_aperiodic mod=<0> rnti=<0x1234>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_aperiodic_release(rrc, &ue_context_p->ue_context) != 0) {
+    prnt("ERR: aperiodic release send failed\n");
+    return 0;
+  }
+
+  prnt("OK: aperiodic release sent to UE rnti=0x%lx\n", rnti_l);
+  return 0;
+}
+
+static int ncr_telnet_rel_aperiodic_rsrc_cmd(char *cmdbuff,
+                                                 int debug,
+                                                 telnet_printfunc_t prnt)
+{
+  (void)debug;
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long rnti_l = 0;
+  long rsrc_id = 0;
+
+  if (!cmdbuff ||
+      !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l) ||
+      !ncr_telnet_get_long(cmdbuff, "rsrc", &rsrc_id)) {
+    prnt("usage: ncr rel_aperiodic_rsrc mod=<0> rnti=<0x1234> rsrc=<id>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_aperiodic_resource_release(rrc,
+                                                 &ue_context_p->ue_context,
+                                                 rsrc_id) != 0) {
+    prnt("ERR: aperiodic resource release send failed\n");
+    return 0;
+  }
+
+  prnt("OK: aperiodic resource release sent to UE rnti=0x%lx rsrc=%ld\n",
+       rnti_l,
+       rsrc_id);
+  return 0;
+}
+
+static int ncr_telnet_release_sp_set_cmd(char *cmdbuff,
+                                         int debug,
+                                         telnet_printfunc_t prnt)
+{
+  (void)debug;
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long rnti_l = 0;
+  long set_id = 0;
+
+  if (!cmdbuff ||
+      !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l) ||
+      !ncr_telnet_get_long(cmdbuff, "set", &set_id)) {
+    prnt("usage: ncr release_sp_set mod=<0> rnti=<0x1234> set=<id>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_semi_persistent_set_release(rrc,
+                                                  &ue_context_p->ue_context,
+                                                  set_id) != 0) {
+    prnt("ERR: semi-persistent set release send failed\n");
+    return 0;
+  }
+
+  prnt("OK: semi-persistent set release sent to UE rnti=0x%lx set=%ld\n", rnti_l, set_id);
+  return 0;
+}
+
+static int ncr_telnet_release_sp_rsrc_cmd(char *cmdbuff,
+                                          int debug,
+                                          telnet_printfunc_t prnt)
+{
+  (void)debug;
+
+  long mod = ncr_telnet_get_long_or(cmdbuff, "mod", 0);
+  long rnti_l = 0;
+  long set_id = 0;
+  long rsrc_id = 0;
+
+  if (!cmdbuff ||
+      !ncr_telnet_get_long(cmdbuff, "rnti", &rnti_l) ||
+      !ncr_telnet_get_long(cmdbuff, "set", &set_id) ||
+      !ncr_telnet_get_long(cmdbuff, "rsrc", &rsrc_id)) {
+    prnt("usage: ncr release_sp_rsrc mod=<0> rnti=<0x1234> set=<id> rsrc=<id>\n");
+    return 0;
+  }
+
+  if (mod < 0 || mod >= NUMBER_OF_gNB_MAX || RC.nrrrc[mod] == NULL) {
+    prnt("ERR: invalid mod=%ld\n", mod);
+    return 0;
+  }
+
+  gNB_RRC_INST *rrc = RC.nrrrc[mod];
+  rrc_gNB_ue_context_t *ue_context_p = ncr_telnet_find_ue(rrc, (rnti_t)rnti_l);
+  if (!ue_context_p) {
+    prnt("ERR: UE not found, rnti=0x%lx\n", rnti_l);
+    return 0;
+  }
+
+  if (ncr_telnet_send_semi_persistent_resource_release(rrc,
+                                                       &ue_context_p->ue_context,
+                                                       set_id,
+                                                       rsrc_id) != 0) {
+    prnt("ERR: semi-persistent resource release send failed\n");
+    return 0;
+  }
+
+  prnt("OK: semi-persistent resource release sent to UE rnti=0x%lx set=%ld rsrc=%ld\n",
+       rnti_l,
+       set_id,
+       rsrc_id);
+  return 0;
+}
+
 static telnetshell_vardef_t ncr_telnet_vardef[] = {
   { "", 0, 0, NULL }
 };
@@ -1453,6 +2141,54 @@ static telnetshell_cmddef_t ncr_telnet_cmdarray[] = {
     "sp",
     "send semi-persistent NCR cfg",
     ncr_telnet_sp_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "rel_periodic_set",
+    "release one periodic NCR forwarding resource set",
+    ncr_telnet_rel_periodic_set_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "rel_periodic_rsrc",
+    "release one periodic NCR forwarding resource",
+    ncr_telnet_rel_periodic_rsrc_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "release_aperiodic",
+    "release the whole aperiodic NCR forwarding config",
+    ncr_telnet_release_aperiodic_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "rel_aperiodic_rsrc",
+    "release one aperiodic NCR forwarding time resource",
+    ncr_telnet_rel_aperiodic_rsrc_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "release_sp_set",
+    "release one semi-persistent NCR forwarding resource set",
+    ncr_telnet_release_sp_set_cmd,
+    {0},
+    0,
+    NULL
+  },
+  {
+    "release_sp_rsrc",
+    "release one semi-persistent NCR forwarding resource",
+    ncr_telnet_release_sp_rsrc_cmd,
     {0},
     0,
     NULL

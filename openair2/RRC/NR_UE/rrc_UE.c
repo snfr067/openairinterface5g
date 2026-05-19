@@ -249,6 +249,89 @@ static void nr_ue_ncr_clear_all_forwarding_rules(void)
   pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
 }
 
+static int nr_ue_ncr_clear_matching_forwarding_rules(nr_ue_ncr_rule_type_t type,
+                                                      bool match_set,
+                                                      long set,
+                                                      bool match_rsrc,
+                                                      long rsrc)
+{
+  int cleared = 0;
+
+  pthread_mutex_lock(&nr_ue_ncr_forwarding_rules_mutex);
+
+  for (int i = 0; i < NR_UE_NCR_MAX_FORWARDING_RULES; i++) {
+    nr_ue_ncr_forwarding_rule_t *rule = &nr_ue_ncr_forwarding_rules[i];
+    if (!rule->valid)
+      continue;
+    if (type != NR_UE_NCR_RULE_NONE && rule->type != type)
+      continue;
+    if (match_set && rule->set != set)
+      continue;
+    if (match_rsrc && rule->rsrc != rsrc)
+      continue;
+
+    memset(rule, 0, sizeof(*rule));
+    cleared++;
+  }
+
+  pthread_mutex_unlock(&nr_ue_ncr_forwarding_rules_mutex);
+  return cleared;
+}
+
+static int nr_ue_ncr_clear_periodic_set(long set)
+{
+  return nr_ue_ncr_clear_matching_forwarding_rules(NR_UE_NCR_RULE_PERIODIC,
+                                                    true,
+                                                    set,
+                                                    false,
+                                                    0);
+}
+
+static int nr_ue_ncr_clear_periodic_resource(long set, long rsrc)
+{
+  return nr_ue_ncr_clear_matching_forwarding_rules(NR_UE_NCR_RULE_PERIODIC,
+                                                    true,
+                                                    set,
+                                                    true,
+                                                    rsrc);
+}
+
+static int nr_ue_ncr_clear_aperiodic_all(void)
+{
+  return nr_ue_ncr_clear_matching_forwarding_rules(NR_UE_NCR_RULE_APERIODIC,
+                                                    false,
+                                                    0,
+                                                    false,
+                                                    0);
+}
+
+static int nr_ue_ncr_clear_aperiodic_resource(long rsrc)
+{
+  return nr_ue_ncr_clear_matching_forwarding_rules(NR_UE_NCR_RULE_APERIODIC,
+                                                    false,
+                                                    0,
+                                                    true,
+                                                    rsrc);
+}
+
+static int nr_ue_ncr_clear_semipersistent_set(long set)
+{
+  return nr_ue_ncr_clear_matching_forwarding_rules(NR_UE_NCR_RULE_SEMI_PERSISTENT,
+                                                    true,
+                                                    set,
+                                                    false,
+                                                    0);
+}
+
+static int nr_ue_ncr_clear_semipersistent_resource(long set, long rsrc)
+{
+  return nr_ue_ncr_clear_matching_forwarding_rules(NR_UE_NCR_RULE_SEMI_PERSISTENT,
+                                                    true,
+                                                    set,
+                                                    true,
+                                                    rsrc);
+}
+
 static int nr_ue_ncr_count_forwarding_rules_locked(void)
 {
   int count = 0;
@@ -1535,7 +1618,23 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
 
   NR_NCR_FwdConfig_r18_t *cfg = ncr_ie->choice.setup;
 
-  /* ---------------- periodic ---------------- */
+  /* ---------------- periodic set release ---------------- */
+  if (cfg->periodicFwdRsrcSetToReleaseList_r18) {
+    for (int i = 0; i < cfg->periodicFwdRsrcSetToReleaseList_r18->list.count; i++) {
+      NR_NCR_PeriodicFwdResourceSetId_r18_t *set_id =
+          cfg->periodicFwdRsrcSetToReleaseList_r18->list.array[i];
+      if (!set_id)
+        continue;
+
+      const int cleared = nr_ue_ncr_clear_periodic_set(*set_id);
+      LOG_I(NR_RRC,
+            "[NCR][UE] PeriodicSet RELEASE: setId=%ld cleared=%d\n",
+            (long)*set_id,
+            cleared);
+    }
+  }
+
+  /* ---------------- periodic add / modify / per-resource release ---------------- */
   if (!cfg->periodicFwdRsrcSetToAddModList_r18) {
     LOG_I(NR_RRC, "[NCR][UE] no periodicFwdRsrcSetToAddModList_r18\n");
   } else {
@@ -1553,6 +1652,23 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
             "[NCR][UE] PeriodicSet: setId=%ld refSCS=%ld\n",
             set->periodicFwdRsrcSetId_r18,
             ref_scs);
+
+      if (set->periodicFwdRsrcToReleaseList_r18) {
+        for (int j = 0; j < set->periodicFwdRsrcToReleaseList_r18->list.count; j++) {
+          NR_NCR_PeriodicFwdResourceId_r18_t *rsrc_id =
+              set->periodicFwdRsrcToReleaseList_r18->list.array[j];
+          if (!rsrc_id)
+            continue;
+
+          const int cleared = nr_ue_ncr_clear_periodic_resource(set->periodicFwdRsrcSetId_r18,
+                                                                 *rsrc_id);
+          LOG_I(NR_RRC,
+                "[NCR][UE] PeriodicRsrc RELEASE: setId=%ld rsrcId=%ld cleared=%d\n",
+                set->periodicFwdRsrcSetId_r18,
+                (long)*rsrc_id,
+                cleared);
+        }
+      }
 
       if (!set->periodicFwdRsrcToAddModList_r18)
         continue;
@@ -1597,7 +1713,8 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
     LOG_I(NR_RRC, "[NCR][UE] no aperiodicFwdConfig_r18\n");
   } else if (cfg->aperiodicFwdConfig_r18->present ==
              NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_release) {
-    LOG_I(NR_RRC, "[NCR][UE] AperiodicCfg RELEASE\n");
+    const int cleared = nr_ue_ncr_clear_aperiodic_all();
+    LOG_I(NR_RRC, "[NCR][UE] AperiodicCfg RELEASE: cleared=%d\n", cleared);
   } else if (cfg->aperiodicFwdConfig_r18->present ==
                  NR_NCR_FwdConfig_r18__aperiodicFwdConfig_r18_PR_setup &&
              cfg->aperiodicFwdConfig_r18->choice.setup) {
@@ -1620,6 +1737,21 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
           ref_scs,
           beam_field_width,
           number_of_fields);
+
+    if (ap->aperiodicFwdTimeRsrcToReleaseList_r18) {
+      for (int i = 0; i < ap->aperiodicFwdTimeRsrcToReleaseList_r18->list.count; i++) {
+        NR_NCR_AperiodicFwdTimeResourceId_r18_t *rsrc_id =
+            ap->aperiodicFwdTimeRsrcToReleaseList_r18->list.array[i];
+        if (!rsrc_id)
+          continue;
+
+        const int cleared = nr_ue_ncr_clear_aperiodic_resource(*rsrc_id);
+        LOG_I(NR_RRC,
+              "[NCR][UE] AperiodicTimeRsrc RELEASE: rsrcId=%ld cleared=%d\n",
+              (long)*rsrc_id,
+              cleared);
+      }
+    }
 
     if (ap->aperiodicFwdTimeRsrcToAddModList_r18) {
       for (int i = 0; i < ap->aperiodicFwdTimeRsrcToAddModList_r18->list.count; i++) {
@@ -1647,7 +1779,23 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
     }
   }
 
-  /* ---------------- semi-persistent ---------------- */
+  /* ---------------- semi-persistent set release ---------------- */
+  if (cfg->semiPersistentFwdRsrcSetToReleaseList_r18) {
+    for (int i = 0; i < cfg->semiPersistentFwdRsrcSetToReleaseList_r18->list.count; i++) {
+      NR_NCR_SemiPersistentFwdResourceSetId_r18_t *set_id =
+          cfg->semiPersistentFwdRsrcSetToReleaseList_r18->list.array[i];
+      if (!set_id)
+        continue;
+
+      const int cleared = nr_ue_ncr_clear_semipersistent_set(*set_id);
+      LOG_I(NR_RRC,
+            "[NCR][UE] SemiPersistentSet RELEASE: setId=%ld cleared=%d\n",
+            (long)*set_id,
+            cleared);
+    }
+  }
+
+  /* ---------------- semi-persistent add / modify / per-resource release ---------------- */
   if (!cfg->semiPersistentFwdRsrcSetToAddModList_r18) {
     LOG_I(NR_RRC, "[NCR][UE] no semiPersistentFwdRsrcSetToAddModList_r18\n");
   } else {
@@ -1665,6 +1813,23 @@ static void nr_rrc_apply_ncr_fwd_config(NR_UE_RRC_INST_t *rrc, const NR_CellGrou
             "[NCR][UE] SemiPersistentSet: setId=%ld refSCS=%ld\n",
             set->semiPersistentFwdRsrcSetId_r18,
             ref_scs);
+
+      if (set->semiPersistentFwdRsrcToReleaseList_r18) {
+        for (int j = 0; j < set->semiPersistentFwdRsrcToReleaseList_r18->list.count; j++) {
+          NR_NCR_SemiPersistentFwdResourceId_r18_t *rsrc_id =
+              set->semiPersistentFwdRsrcToReleaseList_r18->list.array[j];
+          if (!rsrc_id)
+            continue;
+
+          const int cleared = nr_ue_ncr_clear_semipersistent_resource(set->semiPersistentFwdRsrcSetId_r18,
+                                                                       *rsrc_id);
+          LOG_I(NR_RRC,
+                "[NCR][UE] SemiPersistentRsrc RELEASE: setId=%ld rsrcId=%ld cleared=%d\n",
+                set->semiPersistentFwdRsrcSetId_r18,
+                (long)*rsrc_id,
+                cleared);
+        }
+      }
 
       if (!set->semiPersistentFwdRsrcToAddModList_r18)
         continue;
