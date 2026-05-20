@@ -4,6 +4,7 @@ const modalTitle = document.getElementById('modalTitle');
 const closeModal = document.getElementById('closeModal');
 const cancelBtn = document.getElementById('cancelBtn');
 const refreshBtn = document.getElementById('refreshBtn');
+const releaseAllBtn = document.getElementById('releaseAllBtn');
 const messageLog = document.getElementById('messageLog');
 const rulesList = document.getElementById('rulesList');
 const toast = document.getElementById('toast');
@@ -11,6 +12,7 @@ const toast = document.getElementById('toast');
 let currentType = 'Periodic';
 let toastTimer = null;
 let latestState = null;
+let releaseBusy = false;
 
 function showToast(message) {
   toast.textContent = message;
@@ -84,6 +86,41 @@ function setSendingState(isSending, message = '') {
     statusBox.classList.add('hidden');
     statusBox.innerHTML = '';
     modalBackdrop.classList.remove('is-busy');
+  }
+}
+
+function setReleaseBusyState(isBusy, activeButton = null, busyText = '處理中') {
+  releaseBusy = isBusy;
+
+  const releaseButtons = document.querySelectorAll('.rule-release-btn');
+
+  releaseButtons.forEach((button) => {
+    button.disabled = isBusy;
+
+    if (!isBusy) {
+      button.textContent = button.dataset.originalText || 'Release';
+      button.classList.remove('is-loading');
+      return;
+    }
+
+    if (button === activeButton) {
+      button.dataset.originalText = button.dataset.originalText || button.textContent;
+      button.textContent = busyText;
+      button.classList.add('is-loading');
+    }
+  });
+
+  if (releaseAllBtn) {
+    releaseAllBtn.disabled = isBusy;
+
+    if (!isBusy) {
+      releaseAllBtn.textContent = releaseAllBtn.dataset.originalText || 'Release All';
+      releaseAllBtn.classList.remove('is-loading');
+    } else if (activeButton === releaseAllBtn) {
+      releaseAllBtn.dataset.originalText = releaseAllBtn.dataset.originalText || releaseAllBtn.textContent;
+      releaseAllBtn.textContent = busyText;
+      releaseAllBtn.classList.add('is-loading');
+    }
   }
 }
 
@@ -213,6 +250,7 @@ function renderRules(rules) {
             <th>Duration</th>
             <th>Ref SCS</th>
             <th>Status</th>
+            <th>Action</th>
           </tr>
         </thead>
         <tbody>
@@ -228,6 +266,15 @@ function renderRules(rules) {
               <td>${escapeHtml(rule.params.duration_in_symbols)}</td>
               <td>${escapeHtml(rule.params.ref_scs)}</td>
               <td><span class="rule-status">${escapeHtml(rule.status)}</span></td>
+              <td>
+                <button
+                  type="button"
+                  class="primary-btn rule-release-btn"
+                  data-rule-id="${escapeHtml(rule.id ?? rule.params.resource_id)}"
+                >
+                  Release
+                </button>
+              </td>
             </tr>
           `).join('')}
         </tbody>
@@ -235,6 +282,7 @@ function renderRules(rules) {
     </div>
   `;
 }
+
 function renderMessages(messages) {
   if (!messages.length) {
     messageLog.className = 'message-log empty';
@@ -338,6 +386,96 @@ async function sendMessage(event) {
   }
 }
 
+async function releaseRule(ruleId, button) {
+  if (releaseBusy) {
+    return;
+  }
+
+  setReleaseBusyState(true, button, '釋放中');
+
+  try {
+    const response = await fetch('/api/release', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        rule_id: Number(ruleId),
+      }),
+    });
+
+    const result = await response.json();
+
+    if (!response.ok || !result.ok) {
+      const detail = result.telnet_result
+        ? `${result.error}\n${result.telnet_result}`
+        : (result.error || 'Release 失敗');
+
+      showToast(detail);
+
+      if (result.state) {
+        applyState(result.state);
+      }
+
+      return;
+    }
+
+    applyState(result.state);
+    showToast(`Rule #${ruleId} 已透過 telnet 送出 Release`);
+
+  } catch (error) {
+    console.error(error);
+    showToast(`Release 失敗：${error.message}`);
+
+  } finally {
+    setReleaseBusyState(false);
+  }
+}
+
+async function releaseAllRules() {
+  if (releaseBusy) {
+    return;
+  }
+
+  setReleaseBusyState(true, releaseAllBtn, '釋放中');
+
+  try {
+    const response = await fetch('/api/release_all', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({}),
+    });
+
+    const result = await response.json();
+
+    if (!response.ok || !result.ok) {
+      const detail = result.telnet_result
+        ? `${result.error}\n${result.telnet_result}`
+        : (result.error || 'Release All 失敗');
+
+      showToast(detail);
+
+      if (result.state) {
+        applyState(result.state);
+      }
+
+      return;
+    }
+
+    applyState(result.state);
+    showToast('Release All 已透過 telnet 送到 gNB，規則列表已清空');
+
+  } catch (error) {
+    console.error(error);
+    showToast(`Release All 失敗：${error.message}`);
+
+  } finally {
+    setReleaseBusyState(false);
+  }
+}
+
 function refreshAll() {
   loadState().catch((error) => {
     console.error(error);
@@ -352,6 +490,20 @@ document.querySelectorAll('.send-btn').forEach((button) => {
 closeModal.addEventListener('click', hideModal);
 cancelBtn.addEventListener('click', hideModal);
 refreshBtn.addEventListener('click', refreshAll);
+
+if (releaseAllBtn) {
+  releaseAllBtn.addEventListener('click', releaseAllRules);
+}
+
+rulesList.addEventListener('click', (event) => {
+  const button = event.target.closest('.rule-release-btn');
+
+  if (!button) {
+    return;
+  }
+
+  releaseRule(button.dataset.ruleId, button);
+});
 
 sendForm.addEventListener('submit', sendMessage);
 

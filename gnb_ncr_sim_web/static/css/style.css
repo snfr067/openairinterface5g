@@ -629,3 +629,41 @@ input:disabled {
     transform: rotate(360deg);
   }
 }
+
+/* ===== NCR release buttons add-on ===== */
+
+.rules-heading {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.rules-heading h2 {
+  margin: 0;
+}
+
+.rules-heading p {
+  margin-left: auto;
+}
+
+.release-all-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.rules-table th:last-child,
+.rules-table td:last-child {
+  text-align: center;
+  white-space: nowrap;
+}
+
+.rule-release-btn {
+  min-width: 76px;
+  white-space: nowrap;
+}
+
+.rule-release-btn:disabled,
+.release-all-btn:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}

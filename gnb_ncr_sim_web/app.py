@@ -263,9 +263,27 @@ def now_text():
 
 def next_resource_id():
     """
-    resource id 永遠由目前規則數 + 1 自動產生。
+    自動產生下一個 resource id。
+
+    原本在只有新增規則時，使用「目前規則數 + 1」即可。
+    現在加入 release 後，規則列表中可能出現空號；
+    若仍用 len(rules) + 1，會在刪除舊規則後撞到仍存在的 resource id。
+    因此改為「目前最大 resource id + 1」，在沒有 release 的正常新增流程下，
+    行為與原本一致；release 後則能避免重複 set id。
     """
-    return len(state["rules"]) + 1
+
+    if not state["rules"]:
+        return 1
+
+    existing_ids = []
+
+    for rule in state["rules"]:
+        try:
+            existing_ids.append(int(rule.get("params", {}).get("resource_id", rule.get("id"))))
+        except Exception:
+            continue
+
+    return (max(existing_ids) + 1) if existing_ids else 1
 
 
 def read_log_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
@@ -452,6 +470,105 @@ def build_telnet_command(message_type, params, ue_id):
         f"sym={params['symbol_offset']} "
         f"dur={params['duration_in_symbols']}"
     )
+
+
+def build_release_telnet_command(rule, ue_id):
+    """
+    依照規則類型，建立「單筆 Release」要送給 gNB telnet 的指令。
+
+    目前 gNB 端 release 指令對應如下：
+    - Periodic：以 set id 釋放整個 periodic forwarding resource set。
+    - Semi-persistent：以 set id 釋放整個 semi-persistent forwarding resource set。
+    - Aperiodic：以 rsrc id 釋放指定 aperiodic forwarding time resource。
+
+    網站上的每一列規則都會呼叫這個函式，避免前端自行拼 telnet 字串。
+    """
+
+    if not isinstance(rule, dict):
+        raise ValueError("invalid rule")
+
+    params = rule.get("params") or {}
+    rule_type = rule.get("type")
+
+    if rule_type == "Periodic":
+        set_id = int(params["resource_id"])
+        return f"ncr rel_periodic_set mod=0 rnti=0x{ue_id} set={set_id}"
+
+    if rule_type == "Semi-persistent":
+        set_id = int(params["resource_id"])
+        return f"ncr release_sp_set mod=0 rnti=0x{ue_id} set={set_id}"
+
+    if rule_type == "Aperiodic":
+        rsrc_id = int(params["rsrc_id"])
+        return f"ncr rel_aperiodic_rsrc mod=0 rnti=0x{ue_id} rsrc={rsrc_id}"
+
+    raise ValueError(f"unsupported rule type: {rule_type}")
+
+
+def build_release_all_telnet_command(ue_id):
+    """
+    建立 Release All 指令。
+    """
+
+    return f"ncr release_all mod=0 rnti=0x{ue_id}"
+
+
+def find_rule_by_id(rule_id):
+    """
+    從網站目前保存的規則中，找出指定 Rule ID。
+    """
+
+    try:
+        wanted_id = int(rule_id)
+    except Exception:
+        return None
+
+    for rule in state["rules"]:
+        try:
+            current_id = int(rule.get("id", rule.get("params", {}).get("resource_id")))
+        except Exception:
+            continue
+
+        if current_id == wanted_id:
+            return rule
+
+    return None
+
+
+def remove_rules_affected_by_release(rule):
+    """
+    在 telnet release 成功後，同步更新網站端的規則列表。
+
+    - Periodic / Semi-persistent：set release，移除同一 type + 同一 resource_id。
+    - Aperiodic：gNB 指令是依 rsrc id release，因此網站端同步移除
+      所有同一 type + 同一 rsrc_id 的列，避免畫面留下已被實際釋放的殘留規則。
+    """
+
+    if not isinstance(rule, dict):
+        return []
+
+    params = rule.get("params") or {}
+    rule_type = rule.get("type")
+
+    def should_remove(item):
+        item_params = item.get("params") or {}
+
+        if item.get("type") != rule_type:
+            return False
+
+        if rule_type in {"Periodic", "Semi-persistent"}:
+            return str(item_params.get("resource_id")) == str(params.get("resource_id"))
+
+        if rule_type == "Aperiodic":
+            return str(item_params.get("rsrc_id")) == str(params.get("rsrc_id"))
+
+        return False
+
+    removed = [item for item in state["rules"] if should_remove(item)]
+    state["rules"] = [item for item in state["rules"] if not should_remove(item)]
+    state["next_resource_id"] = next_resource_id()
+
+    return removed
 
 
 def send_telnet_command(command):
@@ -696,6 +813,158 @@ def send_message():
             "state": state,
         }
     )
+
+@app.route("/api/release", methods=["POST"])
+def release_rule():
+    """
+    釋放單筆規則：
+    1. 前端送 rule_id。
+    2. 後端自動從 log 抓 NCR UE ID。
+    3. 依規則 type 組出正確 telnet release 指令。
+    4. 指令成功才從網站規則列表移除。
+    """
+
+    ue_id = refresh_ncr_ue_id_from_logs()
+
+    if not ue_id:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "尚未抓到 NCR 的 UE ID，無法送出 release 指令。",
+                "state": state,
+            }
+        ), 400
+
+    raw = request.get_json(silent=True)
+
+    if not isinstance(raw, dict):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "payload must be an object",
+                "state": state,
+            }
+        ), 400
+
+    rule_id = raw.get("rule_id")
+    rule = find_rule_by_id(rule_id)
+
+    if rule is None:
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"找不到 Rule ID #{rule_id}。",
+                "state": state,
+            }
+        ), 404
+
+    try:
+        telnet_command = build_release_telnet_command(rule, ue_id)
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"無法建立 release 指令：{type(exc).__name__}: {exc}",
+                "state": state,
+            }
+        ), 400
+
+    try:
+        telnet_result = send_telnet_command(telnet_command)
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"telnet release 發送失敗：{type(exc).__name__}: {exc}",
+                "telnet_command": telnet_command,
+                "state": state,
+            }
+        ), 502
+
+    if not telnet_result_is_success(telnet_result):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "telnet release 指令被 gNB 拒絕，規則列表未變更。",
+                "telnet_command": telnet_command,
+                "telnet_result": telnet_result,
+                "state": state,
+            }
+        ), 400
+
+    removed_rules = remove_rules_affected_by_release(rule)
+
+    return jsonify(
+        {
+            "ok": True,
+            "released_rule_id": rule_id,
+            "removed_rules": removed_rules,
+            "telnet_command": telnet_command,
+            "telnet_result": telnet_result,
+            "state": state,
+        }
+    )
+
+
+@app.route("/api/release_all", methods=["POST"])
+def release_all_rules():
+    """
+    釋放所有 forwarding 規則：
+    1. 後端自動從 log 抓 NCR UE ID。
+    2. 發送 ncr release_all 到 16888。
+    3. 指令成功才清空網站端規則列表。
+    """
+
+    ue_id = refresh_ncr_ue_id_from_logs()
+
+    if not ue_id:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "尚未抓到 NCR 的 UE ID，無法送出 Release All 指令。",
+                "state": state,
+            }
+        ), 400
+
+    telnet_command = build_release_all_telnet_command(ue_id)
+
+    try:
+        telnet_result = send_telnet_command(telnet_command)
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": f"telnet Release All 發送失敗：{type(exc).__name__}: {exc}",
+                "telnet_command": telnet_command,
+                "state": state,
+            }
+        ), 502
+
+    if not telnet_result_is_success(telnet_result):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "Release All 指令被 gNB 拒絕，規則列表未變更。",
+                "telnet_command": telnet_command,
+                "telnet_result": telnet_result,
+                "state": state,
+            }
+        ), 400
+
+    removed_rules = list(state["rules"])
+    state["rules"] = []
+    state["next_resource_id"] = next_resource_id()
+
+    return jsonify(
+        {
+            "ok": True,
+            "removed_rules": removed_rules,
+            "telnet_command": telnet_command,
+            "telnet_result": telnet_result,
+            "state": state,
+        }
+    )
+
 
 @app.route("/api/messages", methods=["GET"])
 def get_messages():
